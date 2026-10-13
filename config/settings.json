@@ -1,0 +1,9 @@
+{
+  "monitored_paths": [
+    "V:/RH",
+    "Z:/TI"
+  ],
+  "backup_path": "C:/Backup_Dedup",
+  "min_file_size_bytes": 1,
+  "chunk_size_bytes": 65536
+}
