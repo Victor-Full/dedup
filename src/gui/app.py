@@ -1,13 +1,13 @@
 import sys
+from pathlib import Path
 from datetime import datetime
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, 
     QLabel, QTreeWidget, QTreeWidgetItem, QHeaderView, QFileDialog, 
-    QMessageBox, QListWidget, QAbstractItemView, QFrame
+    QMessageBox, QListWidget, QFrame, QMenu
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 
-# Importando o Core
 from core.scanner import Scanner
 from core.hasher import Hasher
 from core.action_manager import ActionManager
@@ -44,8 +44,8 @@ class ScanWorker(QThread):
 class DedupApp(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Dedup CGM v1 - Monitor e Deduplicação")
-        self.resize(1100, 750)
+        self.setWindowTitle("Dedup v1 - Monitor e Deduplicação")
+        self.resize(1150, 750)
         self.setStyleSheet("background-color: #f4f6f9;")
         
         self.action_manager = ActionManager(backup_dir="Backup_Quarentena")
@@ -58,7 +58,7 @@ class DedupApp(QMainWindow):
         main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.setSpacing(0)
 
-        # 1. CABEÇALHO INSTITUCIONAL (Azul PMS e Dourado)
+        # 1. CABEÇALHO INSTITUCIONAL
         header = QFrame()
         header.setStyleSheet("background-color: #002244; border-bottom: 4px solid #FDB913;")
         header.setFixedHeight(80)
@@ -66,23 +66,18 @@ class DedupApp(QMainWindow):
         header_layout.setContentsMargins(20, 0, 20, 0)
         
         title_box = QVBoxLayout()
-        title = QLabel("Dedup CGM - Auditoria de Ficheiros Duplicados")
-        title.setStyleSheet("color: #ffffff; font-size: 22px; font-weight: bold;")
+        title = QLabel("Dedup - Auditoria de Ficheiros Duplicados")
+        title.setStyleSheet("color: #ffffff; font-size: 22px; font-weight: bold; border: none;")
         subtitle = QLabel("Mapeamento Seguro e Limpeza de Espaço em Servidores de Rede")
-        subtitle.setStyleSheet("color: #cbd5e1; font-size: 12px;")
+        subtitle.setStyleSheet("color: #cbd5e1; font-size: 12px; border: none;")
         
         title_box.addWidget(title)
         title_box.addWidget(subtitle)
         header_layout.addLayout(title_box)
         
-        self.status_label = QLabel("Sistema Pronto.")
-        self.status_label.setStyleSheet("color: #FDB913; font-size: 14px; font-weight: bold;")
-        header_layout.addStretch()
-        header_layout.addWidget(self.status_label)
-        
         main_layout.addWidget(header)
 
-        # CONTEÚDO PRINCIPAL (Margens internas)
+        # CONTEÚDO PRINCIPAL
         content_layout = QVBoxLayout()
         content_layout.setContentsMargins(20, 20, 20, 20)
         content_layout.setSpacing(15)
@@ -95,15 +90,15 @@ class DedupApp(QMainWindow):
         self.list_folders.setStyleSheet("background-color: white; border: 1px solid #cbd5e1; border-radius: 4px; font-size: 13px;")
         
         btn_folder_layout = QVBoxLayout()
-        self.btn_add_folder = QPushButton("➕ Adicionar Pasta (Setor)")
+        self.btn_add_folder = QPushButton("➕ Adicionar Pasta")
         self.btn_add_folder.setStyleSheet("QPushButton { background-color: #ffffff; border: 1px solid #cbd5e1; padding: 8px; border-radius: 4px;} QPushButton:hover {background-color: #e2e8f0;}")
         self.btn_add_folder.clicked.connect(self.adicionar_diretorio)
         
-        self.btn_remove_folder = QPushButton("❌ Remover Selecionada")
+        self.btn_remove_folder = QPushButton("❌ Remover Pasta")
         self.btn_remove_folder.setStyleSheet("QPushButton { background-color: #ffffff; border: 1px solid #cbd5e1; padding: 8px; border-radius: 4px;} QPushButton:hover {background-color: #fee2e2;}")
         self.btn_remove_folder.clicked.connect(self.remover_diretorio)
 
-        self.btn_start_scan = QPushButton("🔍 1. Iniciar Análise de Rede")
+        self.btn_start_scan = QPushButton("🔍 1. Iniciar Análise")
         self.btn_start_scan.setStyleSheet("QPushButton { background-color: #0056b3; color: white; padding: 12px; font-weight: bold; border-radius: 4px;} QPushButton:hover {background-color: #004494;} QPushButton:disabled {background-color: #94a3b8;}")
         self.btn_start_scan.setEnabled(False)
         self.btn_start_scan.clicked.connect(self.iniciar_varredura)
@@ -120,65 +115,76 @@ class DedupApp(QMainWindow):
         # 3. TABELA DE RESULTADOS
         self.tree = QTreeWidget()
         self.tree.setHeaderLabels(["Ficheiro / Grupo Identificado", "Tamanho", "Data de Criação", "Status (Idade)"])
-        # Coluna 0 (Ficheiro) permite redimensionar manualmente com bom tamanho inicial
-        self.tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Interactive)
-        self.tree.setColumnWidth(0, 450)
-        
-        # Colunas 1 e 2 (Tamanho e Data) ajustam automaticamente ao conteúdo
-        self.tree.header().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
-        self.tree.header().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
-        
-        # Coluna 3 (Status) preenche o resto do espaço vazio da tela
-        self.tree.header().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
-        self.tree.setStyleSheet("QTreeWidget { font-size: 14px; border: 1px solid #cbd5e1; background-color: white;}")
+        self.tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.tree.setStyleSheet("QTreeWidget { font-size: 14px; border: 1px solid #cbd5e1; background-color: white;} QTreeWidget::item { padding: 5px; }")
         self.tree.itemChanged.connect(self.validar_selecao)
         content_layout.addWidget(self.tree)
 
-        # 4. RODAPÉ DE AÇÕES (Lógica de Apagar Antigos)
+        # 4. RODAPÉ DE AÇÕES (Menu Suspenso e Mesclagem)
         action_layout = QHBoxLayout()
         
-        self.btn_auto_select = QPushButton("⚡ Marcar Automático: Mais Antigos")
-        self.btn_auto_select.setStyleSheet("QPushButton { background-color: #ffffff; border: 2px solid #FDB913; color: #002244; font-weight: bold; padding: 12px; border-radius: 4px;} QPushButton:hover {background-color: #fff9e6;}")
-        self.btn_auto_select.setEnabled(False)
-        self.btn_auto_select.clicked.connect(self.selecionar_mais_antigos)
+        # O Botão de Seleção Inteligente (Com Menu Suspenso)
+        self.btn_smart_select = QPushButton("⚡ Seleção Inteligente ▾")
+        self.btn_smart_select.setStyleSheet("QPushButton { background-color: #ffffff; border: 2px solid #FDB913; color: #002244; font-weight: bold; padding: 12px; border-radius: 4px;} QPushButton:hover {background-color: #fff9e6;} QPushButton::menu-indicator { image: none; }")
+        self.btn_smart_select.setEnabled(False)
         
-        self.btn_action = QPushButton("🗑️ 2. Executar Backup e Eliminar")
-        self.btn_action.setStyleSheet("QPushButton { background-color: #d32f2f; color: white; padding: 12px; font-weight: bold; border-radius: 4px;} QPushButton:disabled {background-color: #fca5a5;} QPushButton:hover:!disabled {background-color: #b71c1c;}")
-        self.btn_action.setEnabled(False)
-        self.btn_action.clicked.connect(self.executar_exclusao)
+        # Configurando as opções do Menu Suspenso (Smart Mark)
+        menu_selecao = QMenu(self)
+        menu_selecao.setStyleSheet("QMenu { background-color: white; border: 1px solid #cbd5e1; font-size: 14px; } QMenu::item { padding: 8px 24px; } QMenu::item:selected { background-color: #f1f5f9; color: #002244; font-weight: bold; }")
         
-        action_layout.addWidget(self.btn_auto_select)
+        acao_antigos = menu_selecao.addAction("🟢 Marcar Mais Antigos (Preservar o Mais Novo)")
+        acao_novos = menu_selecao.addAction("🔵 Marcar Mais Novos (Preservar o Mais Antigo)")
+        menu_selecao.addSeparator()
+        acao_limpar = menu_selecao.addAction("⚪ Limpar Seleção (Desmarcar Tudo)")
+
+        # Conectando as ações à nossa nova função central
+        acao_antigos.triggered.connect(lambda: self.aplicar_smart_mark("antigos"))
+        acao_novos.triggered.connect(lambda: self.aplicar_smart_mark("novos"))
+        acao_limpar.triggered.connect(lambda: self.aplicar_smart_mark("limpar"))
+        
+        # Atrela o menu ao botão
+        self.btn_smart_select.setMenu(menu_selecao)
+
+        # Botão de Mesclar
+        self.btn_merge = QPushButton("📁 2. Mesclar em uma 3ª Pasta")
+        self.btn_merge.setStyleSheet("QPushButton { background-color: #eab308; color: #ffffff; padding: 12px; font-weight: bold; border-radius: 4px;} QPushButton:disabled {background-color: #fef08a;} QPushButton:hover:!disabled {background-color: #ca8a04;}")
+        self.btn_merge.setEnabled(False)
+        self.btn_merge.clicked.connect(self.executar_mesclagem)
+        
+        # Botão de Excluir Padrão
+        self.btn_delete = QPushButton("🗑️ 3. Quarentena e Eliminar")
+        self.btn_delete.setStyleSheet("QPushButton { background-color: #d32f2f; color: white; padding: 12px; font-weight: bold; border-radius: 4px;} QPushButton:disabled {background-color: #fca5a5;} QPushButton:hover:!disabled {background-color: #b71c1c;}")
+        self.btn_delete.setEnabled(False)
+        self.btn_delete.clicked.connect(self.executar_exclusao_padrao)
+        
+        action_layout.addWidget(self.btn_smart_select)
         action_layout.addStretch()
-        action_layout.addWidget(self.btn_action)
+        action_layout.addWidget(self.btn_merge)
+        action_layout.addWidget(self.btn_delete)
         
         content_layout.addLayout(action_layout)
         main_layout.addLayout(content_layout)
 
-    # --- MÉTODOS DE CONTROLE DA LISTA DE PASTAS ---
+    # --- MÉTODOS DE CONTROLE DA LISTA ---
     def adicionar_diretorio(self):
         dir_path = QFileDialog.getExistingDirectory(self, "Selecione a pasta do Setor")
         if dir_path:
-            # Verifica se já não foi adicionada
             items = [self.list_folders.item(x).text() for x in range(self.list_folders.count())]
             if dir_path not in items:
                 self.list_folders.addItem(dir_path)
             self.btn_start_scan.setEnabled(self.list_folders.count() > 0)
 
     def remover_diretorio(self):
-        selected_items = self.list_folders.selectedItems()
-        if not selected_items: return
-        for item in selected_items:
+        selected = self.list_folders.selectedItems()
+        for item in selected:
             self.list_folders.takeItem(self.list_folders.row(item))
         self.btn_start_scan.setEnabled(self.list_folders.count() > 0)
 
-    # --- MÉTODOS DE VARREDURA E RENDERIZAÇÃO ---
+    # --- VARREDURA E RENDERIZAÇÃO ---
     def iniciar_varredura(self):
         target_dirs = [self.list_folders.item(i).text() for i in range(self.list_folders.count())]
-        
         self.btn_start_scan.setEnabled(False)
-        self.btn_add_folder.setEnabled(False)
-        self.btn_remove_folder.setEnabled(False)
-        self.btn_auto_select.setEnabled(False)
+        self.btn_smart_select.setEnabled(False)
         self.tree.clear()
 
         self.worker = ScanWorker(target_dirs)
@@ -190,45 +196,33 @@ class DedupApp(QMainWindow):
     def popular_tabela(self, duplicates_list):
         self.status_label.setText(f"Análise concluída: {len(duplicates_list)} grupos detetados.")
         self.btn_start_scan.setEnabled(True)
-        self.btn_add_folder.setEnabled(True)
-        self.btn_remove_folder.setEnabled(True)
-        
-        if duplicates_list:
-            self.btn_auto_select.setEnabled(True)
+        if duplicates_list: self.btn_smart_select.setEnabled(True)
 
         for grupo in duplicates_list:
             hash_str = grupo[0]['hash'][:16] + "..."
-            from pathlib import Path
-            tamanho = Path(grupo[0]['path']).stat().st_size
+            tamanho = grupo[0]['path'].stat().st_size
             tamanho_fmt = f"{tamanho / 1024.0:.2f} KB" if tamanho < 1048576 else f"{tamanho / 1048576.0:.2f} MB"
             
-            item_pai = QTreeWidgetItem(self.tree, [f"Duplicata (Hash: {hash_str})", tamanho_fmt, "-", f"{len(grupo)} Ficheiros"])
+            item_pai = QTreeWidgetItem(self.tree, [f"Grupo Hash: {hash_str}", tamanho_fmt, "-", f"{len(grupo)} Ficheiros"])
             item_pai.setBackground(0, Qt.GlobalColor.lightGray)
             item_pai.setExpanded(True)
 
-            # O backend (Hasher) já nos entrega a lista ordenada por criação (0 = Mais Antigo, -1 = Mais Novo)
             for idx, arquivo in enumerate(grupo):
                 path_obj = arquivo['path']
                 data_criacao = datetime.fromtimestamp(arquivo['creation_time_ns'] / 1e9).strftime("%d/%m/%Y %H:%M:%S")
                 
-                # Destaca visualmente o mais antigo e o mais novo
-                if idx == 0:
-                    status = "Mais Antigo"
-                elif idx == len(grupo) - 1:
-                    status = "Mais Novo (Preservar)"
-                else:
-                    status = "Intermediário"
+                if idx == 0: status = "Mais Antigo"
+                elif idx == len(grupo) - 1: status = "Mais Novo"
+                else: status = "Intermediário"
                 
                 item_filho = QTreeWidgetItem(item_pai, [str(path_obj), tamanho_fmt, data_criacao, status])
                 item_filho.setData(0, Qt.ItemDataRole.UserRole, path_obj)
-                item_filho.setToolTip(0, str(path_obj))
                 item_filho.setFlags(item_filho.flags() | Qt.ItemFlag.ItemIsUserCheckable)
                 item_filho.setCheckState(0, Qt.CheckState.Unchecked)
 
-    # --- LÓGICA DE NEGÓCIO: SELEÇÃO E EXCLUSÃO ---
-    def selecionar_mais_antigos(self):
-        """Marca todos os ficheiros de um grupo, deixando SEMPRE o Mais Novo desmarcado."""
-        # Desconecta temporariamente o evento de checagem para não travar a UI atualizando o botão 100x
+    # --- LÓGICA DE NEGÓCIO: SMART MARK ---
+    def aplicar_smart_mark(self, criterio: str):
+        """Aplica a regra selecionada no menu suspenso sem travar a interface."""
         self.tree.itemChanged.disconnect(self.validar_selecao)
         
         for index_pai in range(self.tree.topLevelItemCount()):
@@ -237,24 +231,33 @@ class DedupApp(QMainWindow):
             
             for index_filho in range(arquivos_no_grupo):
                 item_filho = item_pai.child(index_filho)
-                # O último filho (arquivos_no_grupo - 1) é o Mais Novo, deixamos Unchecked.
-                if index_filho < arquivos_no_grupo - 1:
-                    item_filho.setCheckState(0, Qt.CheckState.Checked)
-                else:
-                    item_filho.setCheckState(0, Qt.CheckState.Unchecked)
+                
+                if criterio == "limpar":
+                    estado = Qt.CheckState.Unchecked
+                elif criterio == "antigos":
+                    # Marca todos, MENOS o último (que é o Mais Novo)
+                    estado = Qt.CheckState.Checked if index_filho < arquivos_no_grupo - 1 else Qt.CheckState.Unchecked
+                elif criterio == "novos":
+                    # Marca todos, MENOS o primeiro (que é o Mais Antigo / Original)
+                    estado = Qt.CheckState.Checked if index_filho > 0 else Qt.CheckState.Unchecked
+                
+                item_filho.setCheckState(0, estado)
                     
-        # Reconecta e valida uma vez só no final
         self.tree.itemChanged.connect(self.validar_selecao)
         self.validar_selecao()
 
     def validar_selecao(self):
         alvos = self.obter_arquivos_marcados()
         if alvos:
-            self.btn_action.setEnabled(True)
-            self.btn_action.setText(f"🗑️ 2. Executar Backup e Eliminar ({len(alvos)} ficheiros)")
+            self.btn_merge.setEnabled(True)
+            self.btn_delete.setEnabled(True)
+            self.btn_merge.setText(f"📁 2. Mesclar em 3ª Pasta ({len(alvos)})")
+            self.btn_delete.setText(f"🗑️ 3. Quarentena e Eliminar ({len(alvos)})")
         else:
-            self.btn_action.setEnabled(False)
-            self.btn_action.setText("🗑️ 2. Executar Backup e Eliminar")
+            self.btn_merge.setEnabled(False)
+            self.btn_delete.setEnabled(False)
+            self.btn_merge.setText("📁 2. Mesclar em 3ª Pasta")
+            self.btn_delete.setText("🗑️ 3. Quarentena e Eliminar")
 
     def obter_arquivos_marcados(self):
         marcados = []
@@ -266,44 +269,52 @@ class DedupApp(QMainWindow):
             for index_filho in range(arquivos_no_grupo):
                 item_filho = item_pai.child(index_filho)
                 if item_filho.checkState(0) == Qt.CheckState.Checked:
-                    marcados.append({
-                        "path": item_filho.data(0, Qt.ItemDataRole.UserRole), 
-                        "item_ui": item_filho, 
-                        "pai_ui": item_pai
-                    })
+                    marcados.append({"path": item_filho.data(0, Qt.ItemDataRole.UserRole), "item_ui": item_filho, "pai_ui": item_pai})
                     marcados_neste_grupo += 1
                     
-            # Segurança máxima: Bloqueia se tentar apagar TUDO do grupo
-            if arquivos_no_grupo > 0 and marcados_neste_grupo == arquivos_no_grupo:
-                QMessageBox.warning(self, "Ação Protegida", "Não pode apagar todos os ficheiros. O ficheiro mais novo foi desmarcado automaticamente para preservação.")
-                # Desmarca o último (Mais Novo) bloqueando sinais para evitar recursão infinita
-                self.tree.blockSignals(True)
+            if marcados_neste_grupo == arquivos_no_grupo:
+                QMessageBox.warning(self, "Ação Protegida", "Não pode apagar/mesclar TODOS os ficheiros do grupo. Deixamos 1 desmarcado para preservar a informação original.")
                 item_pai.child(arquivos_no_grupo - 1).setCheckState(0, Qt.CheckState.Unchecked)
-                self.tree.blockSignals(False)
-                # Recalcula a lista já que desmarcamos um
                 return self.obter_arquivos_marcados()
 
         return marcados
 
-    def executar_exclusao(self):
+    # --- AÇÕES FINAIS (MESCLAR & EXCLUIR) ---
+    def processar_alvos(self, alvos, mensagem_sucesso):
+        """Função genérica que executa a exclusão de fato usando o ActionManager."""
+        sucessos = 0
+        for alvo in alvos:
+            # Aqui a regra de ouro se aplica: O backend SÓ APAGA se a cópia (backup/mesclagem) for 100% igual
+            if self.action_manager.delete_duplicate(alvo["path"]):
+                sucessos += 1
+                alvo["pai_ui"].removeChild(alvo["item_ui"])
+                if alvo["pai_ui"].childCount() < 2:
+                    self.tree.takeTopLevelItem(self.tree.indexOfTopLevelItem(alvo["pai_ui"]))
+        
+        QMessageBox.information(self, "Operação Concluída", f"{sucessos} ficheiros processados com sucesso.\n{mensagem_sucesso}")
+        self.validar_selecao()
+
+    def executar_exclusao_padrao(self):
         alvos = self.obter_arquivos_marcados()
         if not alvos: return
-
-        resposta = QMessageBox.question(
-            self, "Confirmação de Ação", 
-            f"Vai mover {len(alvos)} ficheiro(s) antigo(s) para a Quarentena e eliminá-los da origem.\nTem a certeza?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-        )
+        resposta = QMessageBox.question(self, "Confirmação", f"Mover {len(alvos)} ficheiro(s) para Quarentena Padrão e eliminar originais?", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
         
         if resposta == QMessageBox.StandardButton.Yes:
-            sucessos = 0
-            for alvo in alvos:
-                if self.action_manager.delete_duplicate(alvo["path"]):
-                    sucessos += 1
-                    alvo["pai_ui"].removeChild(alvo["item_ui"])
-                    
-                    if alvo["pai_ui"].childCount() < 2:
-                        self.tree.takeTopLevelItem(self.tree.indexOfTopLevelItem(alvo["pai_ui"]))
-            
-            QMessageBox.information(self, "Concluído", f"{sucessos} ficheiros antigos mesclados/apagados com segurança.\nForam movidos para a Quarentena.")
-            self.validar_selecao()
+            self.action_manager.backup_dir = Path("Backup_Quarentena") # Garante que vai para quarentena
+            self.processar_alvos(alvos, "Foram movidos para a Quarentena Padrão.")
+
+    def executar_mesclagem(self):
+        alvos = self.obter_arquivos_marcados()
+        if not alvos: return
+        
+        # 1. Pergunta para onde o utilizador quer Mesclar
+        pasta_destino = QFileDialog.getExistingDirectory(self, "Selecione a 3ª Pasta (Destino da Mesclagem)")
+        if not pasta_destino: return # Se cancelar, aborta
+
+        resposta = QMessageBox.question(self, "Confirmar Mesclagem", f"Vai consolidar {len(alvos)} ficheiro(s) na pasta:\n{pasta_destino}\n\nEles serão apagados dos setores de origem após a cópia segura. Confirma?", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        
+        if resposta == QMessageBox.StandardButton.Yes:
+            # A MÁGICA DA ARQUITETURA: Trocamos o diretório de backup temporariamente.
+            # O ActionManager vai aplicar a mesma regra rigorosa (copiar > verificar tamanho > apagar).
+            self.action_manager.backup_dir = Path(pasta_destino)
+            self.processar_alvos(alvos, f"Foram mesclados com segurança na pasta:\n{pasta_destino}")
