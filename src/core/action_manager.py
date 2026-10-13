@@ -33,6 +33,33 @@ class ActionManager:
         shutil.copy2(file_path, dest_path)
         return dest_path
 
+    def delete_duplicate(self, file_path: Path, make_backup: bool = True) -> bool:
+        """Executa a eliminação segura. Usada para o botão 'Mesclar' e 'Eliminar' padrão."""
+        try:
+            if not file_path.exists():
+                self.logger.error(f"FALHA: O ficheiro original desapareceu -> {file_path}")
+                return False
+
+            if make_backup:
+                dest = self.backup_file(file_path)
+                
+                # Validação de segurança
+                if not dest.exists() or dest.stat().st_size != file_path.stat().st_size:
+                    self.logger.error(f"FALHA DE INTEGRIDADE: Backup corrompido -> {file_path}")
+                    return False
+                    
+                self.logger.info(f"BACKUP VALIDADO: {file_path} -> {dest}")
+
+            # Só apaga se o backup passou na validação
+            file_path.unlink()
+            self.logger.info(f"ELIMINADO DA ORIGEM: {file_path}")
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"ERRO CRÍTICO ao processar {file_path}: {e}")
+            return False
+
+
     def _create_windowas_shortcut(self, location_path: Path, target_path: Path) -> bool:
         """Cria um atalho (.lnk) na localização especificada apontando para o alvo."""
         if not win32com:
