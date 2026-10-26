@@ -11,7 +11,11 @@ from collections import deque
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple
+
+
+MAX_ATTEMPTS = 2
+RecoveryBatch = Tuple[Dict[int, List[Dict]], Optional[Dict]]
 
 
 class _ReadFailure(Exception):
@@ -190,6 +194,11 @@ class Hasher:
             'errno': getattr(failure.cause, 'errno', None),
             'winerror': getattr(failure.cause, 'winerror', None),
         }
+        if 'content_attempts' in record:
+            error.update(
+                content_attempt=record['content_attempts'],
+                prior_failures=record['prior_failures'],
+            )
         self.errors.append(error)
         record['last_error'] = error
 
@@ -217,15 +226,69 @@ class Hasher:
             self._report(record, failure, 'compare')
             return False
 
-    def find_duplicates(self, size_grups: Dict[int, List[Dict]]) -> List[List[Dict]]:
+    @staticmethod
+    def _prior_failures(size_grups: Dict, prior_failures: Optional[Dict]) -> Dict:
+        """Valida o orçamento informado sem consultar o sistema de arquivos."""
+        if prior_failures is None:
+            return {}
+        if not isinstance(prior_failures, dict):
+            raise ValueError('prior_failures deve ser um dicionário de caminho para falhas anteriores.')
+        paths = {
+            str(Path(os.path.abspath(record['path'])))
+            for files in size_grups.values() for record in files
+        }
+        normalized = {}
+        for path, count in prior_failures.items():
+            if not isinstance(count, int) or isinstance(count, bool) or not 0 <= count <= MAX_ATTEMPTS:
+                raise ValueError('Cada contagem de prior_failures deve ser um inteiro entre 0 e 2.')
+            try:
+                value = os.fspath(path)
+            except TypeError as error:
+                raise ValueError('As chaves de prior_failures devem ser caminhos de arquivo.') from error
+            if not isinstance(value, str) or not value.strip() or '\x00' in value:
+                raise ValueError('As chaves de prior_failures devem ser caminhos de arquivo não vazios.')
+            key = str(Path(os.path.abspath(value)))
+            if key not in paths:
+                raise ValueError(f'prior_failures contém caminho fora dos candidatos: {key}')
+            if key in normalized and normalized[key] != count:
+                raise ValueError(f'Contagens conflitantes em prior_failures: {key}')
+            normalized[key] = count
+        return normalized
+
+    def find_duplicates(
+        self, size_grups: Dict[int, List[Dict]], *, prior_failures: Optional[Dict] = None,
+        recover_candidates: Optional[Callable[[], RecoveryBatch]] = None,
+        candidates_for_size: Optional[Callable[[int], RecoveryBatch]] = None,
+    ) -> List[List[Dict]]:
         """Retorna grupos sem sobreposição de igualdade observada.
 
         Copia os registros de entrada, agrupa por (tamanho atual, SHA-256),
         confirma por bytes e repete ao final apenas os itens que falharam.
-        Cada item tem no máximo duas tentativas; comparações dependentes podem
-        ser refeitas quando uma referência falha ou um item retorna à análise.
-        A interface ainda precisará apresentar ``errors`` e ``pending_files``.
+        prior_failures informa falhas já consumidas por candidato em uma fase
+        anterior. O total lógico é limitado a dois; sem esse argumento mantém
+        as duas tentativas de conteúdo anteriores. A primeira leitura sempre
+        confere os metadados recebidos, mesmo continuando a tentativa global 2.
+        Comparações dependentes podem ser refeitas dentro da mesma tentativa.
+
+        recover_candidates, quando fornecido, é chamado uma vez após a primeira
+        comparação/rechecagem e antes de repetir conteúdo. Retorna (candidatos,
+        falhas_anteriores) para incorporar arquivos recuperados sem reiniciar os
+        já conhecidos. O chamador pode assim adiar a recuperação do inventário.
+
+        candidates_for_size consulta candidatos do inventário pelo novo tamanho
+        após um hash de repetição bem-sucedido que altere o tamanho conhecido.
+        Retorna (grupos, falhas_anteriores), somente para o tamanho solicitado.
+        Cada tamanho é consultado no máximo uma vez por chamada. O fornecedor
+        deve respeitar o escopo/filtros e incluir exclusivos elegíveis; o hasher
+        não enumera pastas nem reinicia candidatos já conhecidos.
         """
+        # Rejeita um orçamento inválido antes de qualquer leitura e sem apagar
+        # os resultados de uma chamada anterior válida deste comparador.
+        if recover_candidates is not None and not callable(recover_candidates):
+            raise ValueError('recover_candidates deve ser uma função sem argumentos ou None.')
+        if candidates_for_size is not None and not callable(candidates_for_size):
+            raise ValueError('candidates_for_size deve ser uma função de tamanho ou None.')
+        inherited = self._prior_failures(size_grups, prior_failures)
         self.records = []
         self.errors = []
         self.pending_files = []
@@ -236,24 +299,38 @@ class Hasher:
         retry_queue = deque()
         queued = set()
         verified = {}
+        recovery_calls = 0
+        supplemental_count = 0
+        requested_sizes = set()
+        size_candidate_count = 0
 
-        for size, files in size_grups.items():
-            for original in files:
-                path = Path(os.path.abspath(original['path']))
-                key = str(path)
-                if key in by_path:
-                    continue
-                record = dict(original)
-                record.pop('hash', None)
-                record.pop('read_signature', None)
-                record.pop('last_error', None)
-                record.pop('hashed_at', None)
-                record.pop('compared_at', None)
-                record.update(path=path, attempts=0, analysis_status='PENDING')
-                record['requires_revalidation'] = True
-                record.setdefault('size_bytes', size)
-                by_path[key] = record
-                self.records.append(record)
+        def add_records(groups: Dict, budgets: Dict) -> List[Dict]:
+            # Reapresentar um caminho não pode reiniciar sua contagem nem
+            # substituir as evidências da primeira análise por outro snapshot.
+            for key, count in budgets.items():
+                if key in by_path and count != by_path[key]['prior_failures']:
+                    raise ValueError(f'A recuperação não pode alterar o orçamento de um candidato conhecido: {key}')
+            added = []
+            for size, files in groups.items():
+                for original in files:
+                    path = Path(os.path.abspath(original['path']))
+                    key = str(path)
+                    if key in by_path:
+                        continue
+                    record = dict(original)
+                    for field in ('hash', 'read_signature', 'last_error', 'hashed_at', 'compared_at'):
+                        record.pop(field, None)
+                    prior = budgets.get(key, 0)
+                    record.update(
+                        path=path, attempts=prior, prior_failures=prior,
+                        content_attempts=0, analysis_status='PENDING',
+                    )
+                    record['requires_revalidation'] = True
+                    record.setdefault('size_bytes', size)
+                    by_path[key] = record
+                    self.records.append(record)
+                    added.append(record)
+            return added
 
         def fail(record: Dict, failure: _ReadFailure, stage: str) -> None:
             self._report(record, failure, stage)
@@ -264,7 +341,7 @@ class Hasher:
             if old_hash is not None:
                 key = (record['size_bytes'], old_hash)
                 self.hash_table[key] = [item for item in self.hash_table[key] if item is not record]
-            if record['attempts'] < 2:
+            if record['attempts'] < MAX_ATTEMPTS:
                 record['analysis_status'] = 'PENDING_RETRY'
                 key = str(record['path'])
                 if key not in queued:
@@ -275,8 +352,9 @@ class Hasher:
 
         def hash_one(record: Dict) -> Optional[tuple]:
             record['attempts'] += 1
+            record['content_attempts'] += 1
             try:
-                record.update(self._hash_record(record, refresh=record['attempts'] == 2))
+                record.update(self._hash_record(record, refresh=record['content_attempts'] > 1))
             except _ReadFailure as failure:
                 fail(record, failure, 'hash')
                 return None
@@ -337,22 +415,82 @@ class Hasher:
             for key in affected:
                 rebuild(key)
 
-        for record in self.records:
-            if record.get('same_file_as') is not None:
-                record['analysis_status'] = 'SAME_FILE'
-            else:
-                hash_one(record)
-        for key in list(self.hash_table):
-            rebuild(key)
-        recheck_all()
+        def analyze_records(records: List[Dict], *, extra_keys=()) -> None:
+            affected = dict.fromkeys(extra_keys)
+            for record in records:
+                if record['attempts'] == MAX_ATTEMPTS:
+                    # Uma decisão de orçamento, não uma leitura que teria falhado.
+                    fail(record, _ReadFailure(
+                        record['path'], 'ATTEMPT_LIMIT_REACHED',
+                        'As duas tentativas da análise já foram consumidas antes da leitura do conteúdo.',
+                    ), 'budget')
+                elif record.get('same_file_as') is not None:
+                    record['analysis_status'] = 'SAME_FILE'
+                else:
+                    key = hash_one(record)
+                    if key is not None:
+                        affected[key] = None
+            for key in affected:
+                rebuild(key)
+            recheck_all()
+
+        def candidates_at_size(size: int) -> List[Dict]:
+            batch = candidates_for_size(size)
+            if not isinstance(batch, tuple) or len(batch) != 2 or not isinstance(batch[0], dict):
+                raise ValueError('candidates_for_size deve retornar (grupos por tamanho, falhas anteriores).')
+            groups, prior = batch
+            # Rejeita o lote inteiro antes de admitir ou ler novos caminhos.
+            # O inventário é a fonte do escopo; o lote não pode ampliar a
+            # consulta para outros tamanhos ou esconder metadados divergentes.
+            for group_size, files in groups.items():
+                if (not isinstance(group_size, int) or isinstance(group_size, bool)
+                        or group_size != size or not isinstance(files, list)):
+                    raise ValueError('candidates_for_size deve fornecer listas apenas para o tamanho solicitado.')
+                for record in files:
+                    if not isinstance(record, dict) or 'path' not in record:
+                        raise ValueError('Cada candidato por tamanho deve ser um registro com caminho.')
+                    record_size = record.get('size_bytes', group_size)
+                    if (not isinstance(record_size, int) or isinstance(record_size, bool)
+                            or record_size != size):
+                        raise ValueError('O tamanho dos metadados deve coincidir com o tamanho solicitado.')
+            budgets = self._prior_failures(groups, prior)
+            additional = add_records(groups, budgets)
+            requested_sizes.add(size)
+            return additional
+
+        analyze_records(add_records(size_grups, inherited))
+
+        if recover_candidates is not None:
+            batch = recover_candidates()
+            recovery_calls = 1
+            if not isinstance(batch, tuple) or len(batch) != 2 or not isinstance(batch[0], dict):
+                raise ValueError('recover_candidates deve retornar (grupos por tamanho, falhas anteriores).')
+            groups, prior = batch
+            budgets = self._prior_failures(groups, prior)
+            additional = add_records(groups, budgets)
+            supplemental_count = len(additional)
+            # Somente novos candidatos recebem hash; os blocos afetados podem
+            # precisar de nova comparação por bytes com seus representantes.
+            # Mesmo sem adições, confere mudanças ocorridas durante a recuperação.
+            analyze_records(additional)
 
         # Fase final: apenas os itens com falha são hasheados novamente. Falhas
         # novas em referências dependentes também entram na fila, uma única vez.
         while retry_queue:
             record = retry_queue.popleft()
+            previous_size = record['size_bytes']
             key = hash_one(record)
             if key is not None:
-                rebuild(key)
+                size = record['size_bytes']
+                if (candidates_for_size is not None and size != previous_size
+                        and size not in requested_sizes):
+                    additional = candidates_at_size(size)
+                    size_candidate_count += len(additional)
+                    # Inclui o bloco do arquivo repetido mesmo se o fornecedor
+                    # não trouxer candidatos ou trouxer conteúdo diferente.
+                    analyze_records(additional, extra_keys=(key,))
+                else:
+                    rebuild(key)
             if not retry_queue:
                 recheck_all()
 
@@ -370,7 +508,7 @@ class Hasher:
                 record['analysis_status'] = 'MATCH_OBSERVED'
         self.pending_files = [item for item in self.records if item['analysis_status'] == 'FAILED']
         self.recovered_files = [
-            item for item in self.records if item['attempts'] == 2 and 'hash' in item
+            item for item in self.records if item['content_attempts'] > 1 and 'hash' in item
         ]
         self.hash_table = {key: files for key, files in self.hash_table.items() if files}
         self.summary = {
@@ -380,5 +518,15 @@ class Hasher:
             'pending_files': len(self.pending_files),
             'same_file_paths': sum(item['analysis_status'] == 'SAME_FILE' for item in self.records),
             'duplicate_groups': len(duplicates),
+            'inherited_failure_files': sum(item['prior_failures'] > 0 for item in self.records),
+            'blocked_by_prior_failures': sum(
+                item['prior_failures'] == MAX_ATTEMPTS for item in self.records
+            ),
+            'content_attempts': sum(item['content_attempts'] for item in self.records),
+            'total_attempts': sum(item['attempts'] for item in self.records),
+            'recovery_callback_calls': recovery_calls,
+            'supplemental_candidate_files': supplemental_count,
+            'size_candidate_callback_calls': len(requested_sizes),
+            'size_candidate_files': size_candidate_count,
         }
         return duplicates
