@@ -11,7 +11,7 @@ from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Set
-
+from core.exclusion_patterns import ExclusionPatterns
 
 class Scanner:
     DEFAULT_IGNORED_DIRS = {
@@ -23,25 +23,51 @@ class Scanner:
     }
 
     def __init__(
-        self, target_dirs: List[str], ignored_dirs: Optional[Set[str]] = None,
-        ignored_exts: Optional[Set[str]] = None, *,
-        excluded_paths: Optional[List[str]] = None, min_file_size_bytes: int = 1,
+        self, 
+        target_dirs: List[str], 
+        ignored_dirs: Optional[Set[str]] = None,
+        ignored_exts: Optional[Set[str]] = None, 
+        *,
+        excluded_paths: Optional[List[str]] = None,
+        min_file_size_bytes: int = 1,
+        ignored_path_patterns=None,
     ):
-        if min_file_size_bytes < 0:
-            raise ValueError('O tamanho mínimo não pode ser negativo.')
+        if (
+            type(min_file_size_bytes) is not int
+            or min_file_size_bytes < 0
+        ):
+            raise ValueError(
+                'O tamanho mínimo não pode ser negativo.'
+            )
+
         self.target_dirs = list(target_dirs)
+
         self.ignored_dirs = {
-            name.lower() for name in (
-                self.DEFAULT_IGNORED_DIRS if ignored_dirs is None else ignored_dirs
+            name.lower()
+            for name in (
+                self.DEFAULT_IGNORED_DIRS
+                if ignored_dirs is None
+                else ignored_dirs
             )
         }
+
         self.ignored_exts = {
-            ext.lower() for ext in (
-                self.DEFAULT_IGNORED_EXTS if ignored_exts is None else ignored_exts
+            ext.lower()
+            for ext in (
+                self.DEFAULT_IGNORED_EXTS
+                if ignored_exts is None
+                else ignored_exts
             )
         }
+
         self.excluded_paths = list(excluded_paths or [])
         self.min_file_size_bytes = min_file_size_bytes
+
+        rules = ExclusionPatterns(ignored_path_patterns)
+        self.ignored_path_patterns = [
+            text for text, _ in rules.rules
+        ]
+
         self._reset()
 
     def _reset(self):
@@ -57,6 +83,7 @@ class Scanner:
         self._attempts = {}
         self._processed_retry = set()
         self._excluded = []
+        self._pattern_matches = {}
         self._unresolved_exclusions = []
         self._roots = []
         self._visited_dirs = set()
@@ -134,13 +161,77 @@ class Scanner:
             }
 
     def _skip(self, path, reason):
-        self.skipped.append({'path': path, 'reason': reason})
-        self._resolved(path, 'SKIPPED')
+        event = {
+            'path': path,
+            'reason': reason,
+        }
 
+        if reason == 'PATH_PATTERN':
+            event['pattern'] = self._pattern_matches.get(
+                self._path_key(path)
+            )
+
+        self.skipped.append(event)
+        self._resolved(path, 'SKIPPED')
+        
     def _is_excluded(self, path):
         key = self._path_key(path)
         return any(key == item or key.startswith(item.rstrip(os.sep) + os.sep)
                    for item in self._excluded)
+
+    def _pattern_excluded(self, path):
+        key = self._path_key(path)
+
+        if not self._pattern_rules.rules:
+            return False
+
+        if key in self._pattern_matches:
+            return True
+
+        matched = self._pattern_rules.first_match(path)
+
+        if matched is not None:
+            self._pattern_matches[key] = matched
+
+        return matched is not None
+
+    def _plain_root_chain(self, path):
+        """Verifica a raiz e seus ancestrais sem seguir links."""
+
+        root_info = None
+
+        for parent in reversed((path, *path.parents)):
+            info = parent.stat(follow_symlinks=False)
+
+            if self._is_link(info):
+                return None
+
+            if not stat.S_ISDIR(info.st_mode):
+                raise NotADirectoryError(
+                    errno.ENOTDIR,
+                    'Um ancestral não é diretório',
+                    str(parent),
+                )
+
+            root_info = info
+
+        return root_info
+
+    def _directory_filter_reason(self, path):
+        """Retorna a exclusão lexical aplicável, sem consultar o disco."""      
+
+        if self._is_excluded(path):
+            return 'EXCLUDED_PATH'
+
+        if self._pattern_excluded(path):
+            return 'PATH_PATTERN'
+                
+        if (
+            path.name.startswith('.')
+           or path.name.lower() in self._filter_dirs
+        ):
+            return 'DIRECTORY_FILTER'
+        return None
 
     def _resolve_exclusions(self, paths):
         self._current_root = None
@@ -160,17 +251,65 @@ class Scanner:
 
     def _resolve_roots(self):
         roots = {}
+
         for path in self._selected_roots:
             self._current_root = path
+
+            reason = self._directory_filter_reason(path)
+
+            if reason is not None:
+                self._skip(path, reason)
+                continue
+
             try:
+                before = self._plain_root_chain(path)
+
+                if before is None:
+                    self._skip(path, 'LINK_OR_REPARSE_POINT')
+                    continue
+
                 resolved = path.resolve()
+                after = self._plain_root_chain(path)
+
+                if after is None:
+                    self._skip(path, 'LINK_OR_REPARSE_POINT')
+                    continue
+
+                resolved_info = resolved.stat(
+                    follow_symlinks=False
+                )
+                identity = self._file_id(before)
+
+                if identity and (
+                    identity != self._file_id(after)
+                    or identity != self._file_id(resolved_info)
+                ):
+                    raise OSError(
+                        errno.EAGAIN,
+                        'A raiz mudou durante a resolução',
+                        str(path),
+                    )
+
             except OSError as error:
                 self._record_error(path, 'root', error)
-                # Uma nova tentativa não resolve redirecionamentos em silêncio.
-                roots.setdefault(self._path_key(path), path)
+
+                # Uma nova tentativa não resolve redirecionamentos
+                # em silêncio.
+                roots.setdefault(
+                    self._path_key(path),
+                    path,
+                )
+
             else:
-                roots.setdefault(self._path_key(resolved), resolved)
-        self._roots = sorted(roots.values(), key=lambda item: len(item.parts))
+                roots.setdefault(
+                    self._path_key(resolved),
+                    resolved,
+                )
+
+        self._roots = sorted(
+            roots.values(),
+            key=lambda item: len(item.parts),
+        )        
 
     def _collect_file(self, path, owner):
         key = self._path_key(path)
@@ -179,6 +318,9 @@ class Scanner:
         self._touch(path)
         if self._is_excluded(path):
             self._skip(path, 'EXCLUDED_PATH')
+            return
+        if self._pattern_excluded(path):
+            self._skip(path, 'PATH_PATTERN')
             return
         if path.name.startswith('.') or path.suffix.lower() in self._filter_exts:
             self._skip(path, 'FILE_FILTER')
@@ -216,22 +358,23 @@ class Scanner:
         for directory, owner in directories:
             self._current_root = owner
             self._touch(directory)
-            if self._is_excluded(directory):
-                self._skip(directory, 'EXCLUDED_PATH')
+            reason = self._directory_filter_reason(directory)
+            if reason is not None:
+                self._skip(directory, reason)
                 continue
             if self._path_key(directory) in self._visited_dirs:
                 continue
             try:
-                info = directory.stat(follow_symlinks=False)
-                if self._is_link(info):
-                    self._skip(directory, 'LINK_OR_REPARSE_POINT')
+                if self._plain_root_chain(owner) is None:
+                    self._skip(
+                        directory,
+                        'LINK_OR_REPARSE_POINT',
+                    )
                     continue
-                if not stat.S_ISDIR(info.st_mode):
-                    raise NotADirectoryError(errno.ENOTDIR, 'A raiz não é um diretório', str(directory))
-                identity = self._file_id(info)
-                if identity and identity in self._visited_dir_ids:
-                    self._resolved(directory, 'SAME_DIRECTORY')
-                    continue
+
+                info = directory.stat(
+                    follow_symlinks=False
+                )
             except OSError as error:
                 stage = 'root' if directory == owner else 'directory'
                 self._record_error(directory, stage, error)
@@ -251,7 +394,11 @@ class Scanner:
                         dirs[:] = []
                         continue
                     if not stat.S_ISDIR(info.st_mode):
-                        raise NotADirectoryError(errno.ENOTDIR, 'O diretório foi substituído', str(root_path))
+                        raise NotADirectoryError(errno.ENOTDIR, 'O diretório foi substituído', str(root_path),)
+                    if self._is_hidden_or_system(info):
+                        self._skip(root_path, 'HIDDEN_OR_SYSTEM')
+                        dirs[:] = []
+                        continue
                     identity = self._file_id(info)
                 except OSError as error:
                     self._record_error(root_path, 'directory', error)
@@ -270,10 +417,9 @@ class Scanner:
                 for name in dirs:
                     path = root_path / name
                     self._touch(path)
-                    if self._is_excluded(path):
-                        self._skip(path, 'EXCLUDED_PATH')
-                    elif name.lower() in self._filter_dirs or name.startswith('.'):
-                        self._skip(path, 'DIRECTORY_FILTER')
+                    reason = self._directory_filter_reason(path)
+                    if reason is not None:
+                        self._skip(path, reason)
                     else:
                         try:
                             info = path.stat(follow_symlinks=False)
@@ -294,6 +440,19 @@ class Scanner:
         path, owner = event['path'], event['root']
         self._current_root = owner
         self._touch(path)
+
+        try:
+            if self._plain_root_chain(owner) is None:
+                self._skip(path, 'LINK_OR_REPARSE_POINT')
+                return False
+
+        except OSError as error:
+            self._record_error(
+                path,
+                event['stage'],
+                error,
+            )
+            return False
         try:
             relative = path.relative_to(owner)
         except (ValueError, TypeError):
@@ -307,11 +466,9 @@ class Scanner:
         if event['stage'] != 'file' and path != owner:
             parents.append(path)
         for parent in parents:
-            if self._is_excluded(parent):
-                self._skip(path, 'EXCLUDED_PATH')
-                return False
-            if parent != owner and (parent.name.startswith('.') or parent.name.lower() in self._filter_dirs):
-                self._skip(path, 'DIRECTORY_FILTER')
+            reason = self._directory_filter_reason(parent)
+            if reason is not None:
+                self._skip(path, reason)
                 return False
             try:
                 info = parent.stat(follow_symlinks=False)
@@ -320,7 +477,7 @@ class Scanner:
                     return False
                 if not stat.S_ISDIR(info.st_mode):
                     raise NotADirectoryError(errno.ENOTDIR, 'Um ancestral deixou de ser diretório', str(parent))
-                if parent != owner and self._is_hidden_or_system(info):
+                if self._is_hidden_or_system(info):    
                     self._skip(path, 'HIDDEN_OR_SYSTEM')
                     return False
             except OSError as error:
@@ -366,6 +523,9 @@ class Scanner:
         self._filter_dirs = set(self.ignored_dirs)
         self._filter_exts = set(self.ignored_exts)
         self._minimum = self.min_file_size_bytes
+        self._pattern_rules = ExclusionPatterns(
+            tuple(self.ignored_path_patterns)
+        )
         self._selected_roots = [self._absolute(path) for path in self.target_dirs]
         self._resolve_exclusions([self._absolute(path) for path in self.excluded_paths])
         if not self._unresolved_exclusions:

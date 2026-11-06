@@ -16,7 +16,13 @@ from core.scanner import Scanner
 from core.hasher import Hasher
 from core.action_manager import ActionManager, BackupError
 from core.report_store import ReportStore, ReportStoreError
-from utils.config_parser import ConfigError, load_config, validate_config
+from utils.config_parser import (
+    CONFIG_PATH,
+    PROJECT_ROOT,
+    ConfigError,
+    load_config,
+    validate_config,
+)
 
 
 REASONS = {
@@ -36,6 +42,8 @@ SKIP_REASONS = {
     'FILE_FILTER': 'Nome ou extensão filtrada',
     'LINK_OR_SPECIAL_FILE': 'Link ou arquivo especial',
     'HIDDEN_OR_SYSTEM': 'Arquivo ou pasta oculto/de sistema',
+    'PATH_PATTERN': 'Regra de exclusão por padrão',
+    
 }
 STAGES = {
     'root': 'Raiz', 'directory': 'Diretório', 'walk': 'Enumeração',
@@ -77,9 +85,23 @@ class ScanWorker(QThread):
         config = validate_config(config)
         database = str(self.report_store.database_path)
         self.config = validate_config({
-            **config, 'excluded_paths': config['excluded_paths'] + [
-                database + suffix for suffix in ('', '-journal', '-wal', '-shm')
-            ],
+            **config,
+            'excluded_paths': (
+                config['excluded_paths']
+                + [
+                    database + suffix
+                    for suffix in (
+                        '',
+                        '-journal',
+                        '-wal',
+                        '-shm',
+                    )
+                ]
+                + [
+                    str(CONFIG_PATH),
+                    str(PROJECT_ROOT / 'logs'),
+                ]
+            ),
         })
 
     def run(self):
@@ -93,6 +115,7 @@ class ScanWorker(QThread):
                 ignored_exts=config['ignored_exts'],
                 excluded_paths=config['excluded_paths'],
                 min_file_size_bytes=config['min_file_size_bytes'],
+                ignored_path_patterns=config['ignored_path_patterns'],
             )
             size_groups = scanner.scan_directory()
             self.progress.emit(
@@ -928,10 +951,27 @@ class DedupApp(QMainWindow):
             self._add_issue(error, attempt, outcome)
         self.skipped_tree.clear()
         for skipped in report['skipped']:
-            item = QTreeWidgetItem(self.skipped_tree, [
-                str(skipped['path']), SKIP_REASONS.get(skipped['reason'], skipped['reason']),
-            ])
-            item.setData(0, Qt.ItemDataRole.UserRole, dict(skipped))
+            reason = SKIP_REASONS.get(
+                skipped['reason'],
+                skipped['reason'],
+            )
+
+            if skipped.get('pattern'):
+                reason += f": {skipped['pattern']}"
+
+            item = QTreeWidgetItem(
+                self.skipped_tree,
+                [
+                    str(skipped['path']),
+                    reason,
+                ],
+            )
+
+            item.setData(
+                0,
+                Qt.ItemDataRole.UserRole,
+                dict(skipped),
+            )
         pending = len(report['pending_files'])
         scan_failures = len(report['scan_pending_errors'])
         scan_summary = report['scan_summary']

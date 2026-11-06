@@ -9,7 +9,10 @@ import os
 import tempfile
 from pathlib import Path
 from typing import Any, Dict, Optional
-
+from core.exclusion_patterns import (
+    ExclusionPatterns, 
+    ExclusionPatternError,
+)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 CONFIG_PATH = PROJECT_ROOT / 'config' / 'settings.json'
@@ -26,18 +29,46 @@ def _config_path(value=None) -> Path:
 
 def _path(value: Any, field: str) -> str:
     if not isinstance(value, str) or not value.strip():
-        raise ConfigError(f'{field}: informe um caminho de pasta não vazio.')
+        raise ConfigError(
+            f'{field}: informe um caminho de pasta não vazio.'
+        )
     value = value.strip()
+
     if any(ord(character) < 32 for character in value):
-        raise ConfigError(f'{field}: o caminho contém caracteres de controle.')
+        raise ConfigError(
+            f'{field}: o caminho contém caracteres de controle.'
+        )
+
+    if os.name == 'nt' and value.startswith(('\\\\?\\', '\\\\.\\')):
+        raise ConfigError(
+            f'{field}: namespace de dispositivo não permitido.'
+        )
+
     path = Path(value)
+
+    if os.name == 'nt' and (
+        os.path.isreserved(str(path))
+        or any(
+            ':' in part or part.endswith((' ', '.'))
+            for part in path.parts[1:]
+        )
+    ):
+        raise ConfigError(
+            f'{field}: nome reservado, fluxo alternativo '
+            'ou caminho ambíguo.'
+        )
+
     if os.name == 'nt' and bool(path.drive) != bool(path.root):
-        raise ConfigError(f'{field}: use um caminho absoluto completo ou relativo ao projeto.')
+        raise ConfigError(
+            f'{field}: use um caminho absoluto completo '
+            'ou relativo ao projeto.'
+        )
+
     if not path.is_absolute():
         path = PROJECT_ROOT / path
-    # Normalização lexical: não acessa rede/disco para consultar essas pastas.
-    return os.path.normpath(str(path))
 
+    # Normalização lexical: não consulta essas pastas no disco ou na rede.
+    return os.path.normpath(str(path))
 
 def _paths(value: Any, field: str) -> list:
     if not isinstance(value, list):
@@ -89,6 +120,7 @@ def validate_config(config_data: Dict[str, Any]) -> Dict[str, Any]:
         'excluded_paths': [],
         'ignored_dirs': None,
         'ignored_exts': None,
+        'ignored_path_patterns': [],
     }
     unknown = set(config_data) - set(defaults)
     if unknown:
@@ -104,6 +136,17 @@ def validate_config(config_data: Dict[str, Any]) -> Dict[str, Any]:
     config['excluded_paths'] = _paths(config['excluded_paths'], 'excluded_paths')
     for field in ('ignored_dirs', 'ignored_exts'):
         config[field] = _filters(config[field], field)
+
+    try:
+        expressions = ExclusionPatterns(
+        config['ignored_path_patterns']
+        )
+    except ExclusionPatternError as error:
+        raise ConfigError(f'ignored_path_patterns: {error}') from error
+
+    config['ignored_path_patterns'] = [
+        text for text, _ in expressions.rules
+    ]
 
     backup = os.path.normcase(config['backup_path'])
     for monitored in config['monitored_paths']:
