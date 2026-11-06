@@ -13,12 +13,14 @@ class ExclusionPatternError(ValueError):
 
 class ExclusionPatterns:
     def __init__(self, patterns=None):
+        patterns = [] if patterns is None else patterns
+
         if (
             not isinstance(patterns, (list, tuple))
             or len(patterns) > MAX_PATTERNS
         ):
             raise ExclusionPatternError(
-                f"Informe até {MAX_PATTERNS} expressões."
+                f"Informe uma lista com até {MAX_PATTERNS} expressões."
             )
 
         unique = []
