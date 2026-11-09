@@ -48,7 +48,10 @@ SKIP_REASONS = {
 STAGES = {
     'root': 'Raiz', 'directory': 'Diretório', 'walk': 'Enumeração',
     'file': 'Metadados', 'exclude': 'Exclusão do escopo',
-    'hash': 'SHA-256', 'compare': 'Comparação de bytes', 'recheck': 'Revalidação',
+    'partial_hash': 'SHA-256 dos primeiros 64 KiB',
+    'hash': 'SHA-256 completo',
+    'compare': 'Comparação de bytes',
+    'recheck': 'Revalidação',
     'budget': 'Limite de tentativas',
 }
 SCAN_OUTCOMES = {
@@ -119,7 +122,7 @@ class ScanWorker(QThread):
             )
             size_groups = scanner.scan_directory()
             self.progress.emit(
-                'Fase 2/3: primeira comparação por SHA-256 e bytes; '
+                'Fase 2/3: prefixo de 64 KiB, SHA-256 completo e bytes; '
                 'falhas serão tratadas na recuperação final...'
             )
             candidates_by_size = {}
@@ -918,6 +921,9 @@ class DedupApp(QMainWindow):
         self.popular_tabela(report['duplicates'])
         records = {str(item['path']): item for item in report['records']}
         states = {
+            'NO_PARTIAL_MATCH': (
+                'Sem par de mesmo tamanho e prefixo nesta análise'
+            ),
             'MATCH_OBSERVED': 'Igualdade observada',
             'NO_CONFIRMED_MATCH': 'Sem duplicata confirmada',
             'SAME_FILE': 'Mesmo arquivo físico',
@@ -980,6 +986,7 @@ class DedupApp(QMainWindow):
             ('Relatório histórico; sem revalidação atual. ' if self._historical else '')
             + f"{conclusion}: {len(report['inventory'])} arquivos inventariados; "
             f"{len(report['duplicates'])} grupos de igualdade observada; "
+            f"{report['summary'].get('partial_only_files', 0)} candidatos sem leitura integral após o filtro de prefixo; "
             f"{report['summary']['size_candidate_files']} candidatos incorporados após mudança de tamanho; "
             f"{report['summary']['inherited_failure_files']} candidatos com falha anterior no inventário; "
             f"{len(report['recovered_files'])} arquivos recuperados na comparação; "

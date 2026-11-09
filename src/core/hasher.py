@@ -15,6 +15,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 
 MAX_ATTEMPTS = 2
+PARTIAL_HASH_BYTES = 64 * 1024
 RecoveryBatch = Tuple[Dict[int, List[Dict]], Optional[Dict]]
 
 
@@ -130,26 +131,95 @@ class Hasher:
             raise self._changed(path)
         return block
 
-    def _hash_record(self, record: Dict, *, refresh: bool = False) -> Dict:
+    def _partial_hash_record(self,
+        record: Dict, 
+        *,
+        refresh: bool = False,
+    ) -> Dict:
         path = record['path']
         digest = hashlib.sha256()
+
         with self._reader(record, refresh=refresh) as (stream, info):
-            remaining = info.st_size
+            remaining = min(PARTIAL_HASH_BYTES, info.st_size)
+
             while remaining:
                 count = min(self.chunk_size, remaining)
                 digest.update(self._block(stream, path, count))
                 remaining -= count
-            if self._read(stream, path, 1):
+
+            if (
+                info.st_size <= PARTIAL_HASH_BYTES
+                and self._read(stream, path, 1)
+            ):
                 raise self._changed(path)
+
         creation = getattr(info, 'st_birthtime_ns', None)
+
         if creation is None and os.name == 'nt':
             creation = info.st_ctime_ns
+
+        return {
+            'partial_hash': digest.hexdigest(),
+            'partial_hashed_at': self._now(),
+            'size_bytes': info.st_size,
+            'modified_time_ns': info.st_mtime_ns,
+            'creation_time_ns': creation,
+            'file_id': (
+                (info.st_dev, info.st_ino) 
+                if info.st_ino else None
+            ),
+            'read_signature': self._signature(info),
+        }
+
+    def _hash_record(self, record: Dict, *, refresh: bool = False) -> Dict:
+        path = record['path']
+        digest = hashlib.sha256()
+        prefix_digest = hashlib.sha256()
+
+        with self._reader(record, refresh=refresh) as (stream, info):
+            remaining = info.st_size
+            prefix_remaining = min(
+                PARTIAL_HASH_BYTES,
+                info.st_size,
+            )
+
+            while remaining:
+                count = min(self.chunk_size, remaining)
+                block = self._block(stream, path, count)
+
+                digest.update(block)
+
+                prefix_count = min(
+                    prefix_remaining,
+                    len(block),
+                )
+                prefix_digest.update(block[:prefix_count])
+                prefix_remaining -= prefix_count
+
+                remaining -= count
+
+            if self._read(stream, path, 1):
+                raise self._changed(path)
+
+            expected_prefix = record.get('partial_hash')
+
+            if(
+                expected_prefix is not None
+                and prefix_digest.hexdigest() != expected_prefix
+            ):
+                raise self._changed(path)
+
+        creation = getattr(info, 'st_birthtime_ns', None)
+
+        if creation is None and os.name == 'nt':
+            creation = info.st_ctime_ns
+
         return {
             'hash': digest.hexdigest(),
             'size_bytes': info.st_size,
             'modified_time_ns': info.st_mtime_ns,
             'creation_time_ns': creation,
-            'file_id': (info.st_dev, info.st_ino) if info.st_ino else None,
+            'file_id': ((info.st_dev, info.st_ino) if info.st_ino else None),
             'read_signature': self._signature(info),
             'hashed_at': self._now(),
         }
@@ -303,6 +373,9 @@ class Hasher:
         supplemental_count = 0
         requested_sizes = set()
         size_candidate_count = 0
+        partial_table = {}
+        partial_hash_attempts = 0
+        full_hash_attempts = 0
 
         def add_records(groups: Dict, budgets: Dict) -> List[Dict]:
             # Reapresentar um caminho não pode reiniciar sua contagem nem
@@ -318,7 +391,7 @@ class Hasher:
                     if key in by_path:
                         continue
                     record = dict(original)
-                    for field in ('hash', 'read_signature', 'last_error', 'hashed_at', 'compared_at'):
+                    for field in ('hash', 'partial_hash', 'read_signature', 'last_error', 'hashed_at', 'partial_hashed_at', 'compared_at',):
                         record.pop(field, None)
                     prior = budgets.get(key, 0)
                     record.update(
@@ -334,6 +407,22 @@ class Hasher:
 
         def fail(record: Dict, failure: _ReadFailure, stage: str) -> None:
             self._report(record, failure, stage)
+            old_partial = record.pop('partial_hash', None)
+
+            if old_partial is not None:
+                partial_key = (
+                    record['size_bytes'],
+                    old_partial,
+                )
+
+                partial_table[partial_key] = [
+                    item
+                    for item in partial_table.get(partial_key, [])
+                    if item is not record
+                ]
+
+            record.pop('partial_hashed_at', None)
+
             old_hash = record.pop('hash', None)
             record.pop('read_signature', None)
             record.pop('hashed_at', None)
@@ -350,18 +439,72 @@ class Hasher:
             else:
                 record['analysis_status'] = 'FAILED'
 
-        def hash_one(record: Dict) -> Optional[tuple]:
+        def hash_one(record: Dict) -> set:
+            nonlocal partial_hash_attempts, full_hash_attempts
+
+            affected = set ()
+
             record['attempts'] += 1
             record['content_attempts'] += 1
+            partial_hash_attempts += 1
+
             try:
-                record.update(self._hash_record(record, refresh=record['content_attempts'] > 1))
+                record.update(
+                    self._partial_hash_record(
+                        record,
+                        refresh=record['content_attempts'] > 1,
+                    )
+                )
             except _ReadFailure as failure:
-                fail(record, failure, 'hash')
-                return None
-            record['analysis_status'] = 'HASHED'
-            key = (record['size_bytes'], record['hash'])
-            self.hash_table.setdefault(key, []).append(record)
-            return key
+                fail(record, failure, 'partial_hash')
+                return affected
+            
+            record['analysis_status'] = 'PARTIAL_HASHED'
+
+            partial_key = (record['size_bytes'], record['partial_hash'])
+
+            bucket = partial_table.setdefault(
+                partial_key,
+                [],
+            )
+            bucket.append(record)
+
+            if len(bucket) < 2:
+                return affected
+
+            # Um candidato recuperado pode promover um prefixo
+            # que já estava aguardando um par.
+            for candidate in list(bucket):
+                if 'hash' in candidate:
+                    continue
+
+                full_hash_attempts +=1
+
+                try:
+                    # Valida a assinatura registrada na leitura parcial.
+                    # O hash completo continua a mesma tentativa lógica.
+                    candidate.update(
+                        self._hash_record(candidate)
+                    )
+                except _ReadFailure as failure:
+                    fail(candidate, failure, 'hash')
+                    continue
+
+                candidate['analysis_status'] = 'HASHED'
+
+                key = (
+                    candidate['size_bytes'],
+                    candidate['hash'],
+                )
+
+                self.hash_table.setdefault(
+                    key,
+                    [],
+                ).append(candidate)
+
+                affected.add(key)
+
+            return affected
 
         def check_current(record: Dict) -> None:
             if self._signature(self._path_info(record['path'])) != record['read_signature']:
@@ -405,12 +548,13 @@ class Hasher:
         def recheck_all() -> None:
             affected = set()
             for record in self.records:
-                if 'hash' not in record:
+                if 'partial_hash' not in record:
                     continue
                 try:
                     check_current(record)
                 except _ReadFailure as failure:
-                    affected.add((record['size_bytes'], record['hash']))
+                    if 'hash' in record:
+                        affected.add((record['size_bytes'], record['hash']))
                     fail(record, failure, 'recheck')
             for key in affected:
                 rebuild(key)
@@ -427,8 +571,7 @@ class Hasher:
                 elif record.get('same_file_as') is not None:
                     record['analysis_status'] = 'SAME_FILE'
                 else:
-                    key = hash_one(record)
-                    if key is not None:
+                    for key in hash_one(record):
                         affected[key] = None
             for key in affected:
                 rebuild(key)
@@ -479,17 +622,26 @@ class Hasher:
         while retry_queue:
             record = retry_queue.popleft()
             previous_size = record['size_bytes']
-            key = hash_one(record)
-            if key is not None:
-                size = record['size_bytes']
-                if (candidates_for_size is not None and size != previous_size
-                        and size not in requested_sizes):
-                    additional = candidates_at_size(size)
-                    size_candidate_count += len(additional)
-                    # Inclui o bloco do arquivo repetido mesmo se o fornecedor
-                    # não trouxer candidatos ou trouxer conteúdo diferente.
-                    analyze_records(additional, extra_keys=(key,))
-                else:
+            affected = hash_one(record)
+
+            if (
+                'partial_hash' in record
+                and candidates_for_size is not None
+                and record['size_bytes'] != previous_size
+                and record['size_bytes'] not in requested_sizes
+            ):
+                additional = candidates_at_size(
+                    record['size_bytes']
+                )
+
+                size_candidate_count += len(additional)
+
+                analyze_records(
+                    additional,
+                    extra_keys=affected,
+                )
+            else:
+                for key in affected:
                     rebuild(key)
             if not retry_queue:
                 recheck_all()
@@ -498,6 +650,9 @@ class Hasher:
         for record in self.records:
             if record['analysis_status'] == 'HASHED':
                 record['analysis_status'] = 'NO_CONFIRMED_MATCH'
+
+            elif record['analysis_status'] == 'PARTIAL_HASHED':
+                record['analysis_status'] = 'NO_PARTIAL_MATCH'
         for group in duplicates:
             group.sort(key=lambda item: (
                 item.get('creation_time_ns') is None,
@@ -508,12 +663,22 @@ class Hasher:
                 record['analysis_status'] = 'MATCH_OBSERVED'
         self.pending_files = [item for item in self.records if item['analysis_status'] == 'FAILED']
         self.recovered_files = [
-            item for item in self.records if item['content_attempts'] > 1 and 'hash' in item
+            item for item in self.records if( item['content_attempts'] > 1 and 'partial_hash' in item)
         ]
         self.hash_table = {key: files for key, files in self.hash_table.items() if files}
         self.summary = {
             'candidate_files': len(self.records),
             'hashed_files': sum('hash' in item for item in self.records),
+            'partial_hashed_files': sum(
+                'partial_hash' in item
+                for item in self.records
+            ),
+            'partial_only_files': sum(
+                item['analysis_status'] == 'NO_PARTIAL_MATCH'
+                for item in self.records
+            ),
+            'partial_hash_attempts': partial_hash_attempts,
+            'full_hash_attempts': full_hash_attempts,
             'recovered_files': len(self.recovered_files),
             'pending_files': len(self.pending_files),
             'same_file_paths': sum(item['analysis_status'] == 'SAME_FILE' for item in self.records),
