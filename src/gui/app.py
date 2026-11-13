@@ -26,6 +26,12 @@ from utils.config_parser import (
     validate_config,
 )
 
+from core.smart_mark import (
+    SelectionError,
+    plan_selection,
+    REASONS as REASONS_SELECTION,
+)
+
 
 REASONS = {
     'FILE_CHANGED': 'Arquivo alterado durante a análise',
@@ -831,13 +837,41 @@ class DedupApp(QMainWindow):
         actions = QHBoxLayout()
         self.btn_smart_select = QPushButton('Seleção para revisão ▾')
         menu = QMenu(self)
-        menu.addAction('Marcar demais; preservar o mais novo por criação').triggered.connect(
-            lambda: self.aplicar_smart_mark('antigos')
+        menu.addAction(
+            'Preservar a cópia da pasta oficial...'
+        ).triggered.connect(
+            lambda: self.aplicar_smart_mark('official')
         )
-        menu.addAction('Marcar demais; preservar o mais antigo por criação').triggered.connect(
-            lambda: self.aplicar_smart_mark('novos')
+
+        menu.addAction(
+            'Preservar o mais novo por criação'
+        ).triggered.connect(
+            lambda: self.aplicar_smart_mark('creation_newest')
         )
-        menu.addAction('Limpar seleção').triggered.connect(lambda: self.aplicar_smart_mark('limpar'))
+
+        menu.addAction(
+            'Preservar o mais antigo por criação'
+        ).triggered.connect(
+            lambda: self.aplicar_smart_mark('creation_oldest')
+        )
+
+        menu.addAction(
+            'Preservar o mais novo por modificação'
+        ).triggered.connect(
+            lambda: self.aplicar_smart_mark('modified_newest')
+        )
+
+        menu.addAction(
+            'Preservar o mais antigo por modificação'
+        ).triggered.connect(
+            lambda: self.aplicar_smart_mark('modified_oldest')
+        )
+
+        menu.addAction(
+            'Limpar seleção'
+        ).triggered.connect(
+            lambda: self.aplicar_smart_mark('limpar')
+        )
         self.btn_smart_select.setMenu(menu)
         actions.addWidget(self.btn_smart_select)
         actions.addStretch()
@@ -867,16 +901,52 @@ class DedupApp(QMainWindow):
 
     def _backup_records(self):
         if self._historical or self.last_report is None:
-            return []
-        selected = {Path(item['path']) for item in self.obter_arquivos_marcados()}
+                return []
+
+        selected = {
+            Path(item['path'])
+            for item in self.obter_arquivos_marcados()
+        }
+
+        for index in range(
+            self.tree.topLevelItemCount()
+        ):
+            reference = self.tree.topLevelItem(index).data(
+                0,
+                Qt.ItemDataRole.UserRole + 2,
+            )
+
+            if (
+                reference is not None
+                and Path(reference) in selected
+            ):
+                raise ValueError(
+                    'A referência automática '
+                    'deve permanecer desmarcada.'
+                )
+
         records = []
+
         for group in self.last_report['duplicates']:
-            marked = [record for record in group if Path(record['path']) in selected]
+            marked = [
+                record
+                for record in group
+                if Path(record['path']) in selected
+            ]
+
             if marked and len(marked) == len(group):
-                raise ValueError('Mantenha um arquivo desmarcado por grupo.')
+                raise ValueError(
+                    'Mantenha um arquivo desmarcado por grupo.'
+                )
+
             records.extend(marked)
+
         if len(records) != len(selected):
-            raise ValueError('Seleção não pertence aos grupos da análise atual.')
+            raise ValueError(
+                'Seleção não pertence aos grupos '
+                'da análise atual.'
+            )
+
         return records
 
     def _has_unsaved_report(self):
@@ -1370,52 +1440,346 @@ class DedupApp(QMainWindow):
             )
 
     def aplicar_smart_mark(self, criterio):
-        if self._busy() or self._historical or criterio not in ('antigos', 'novos', 'limpar'):
+        if self._busy() or self._historical:
             return
-        unavailable = 0
-        with QSignalBlocker(self.tree):
-            for index in range(self.tree.topLevelItemCount()):
+
+        aliases = {
+            'antigos': 'creation_newest',
+            'novos': 'creation_oldest',
+        }
+
+        strategy = aliases.get(
+            criterio,
+            criterio,
+        )
+
+        if strategy == 'limpar':
+            with QSignalBlocker(self.tree):
+                for index in range(
+                    self.tree.topLevelItemCount()
+                ):
+                    parent = self.tree.topLevelItem(index)
+
+                    parent.setData(
+                        0,
+                        Qt.ItemDataRole.UserRole + 2,
+                        None,
+                    )
+                    parent.setText(
+                        4,
+                        f'{parent.childCount()} arquivos; '
+                        'igualdade observada',
+                    )
+                    parent.setToolTip(4, '')
+
+                    for child_index in range(
+                        parent.childCount()
+                    ):
+                        child = parent.child(child_index)
+
+                        child.setCheckState(
+                            0,
+                            Qt.CheckState.Unchecked,
+                        )
+                        child.setText(
+                            4,
+                            'Exige revalidação para agir',
+                        )
+
+            self.validar_selecao()
+            return
+
+        if self.last_report is None:
+            return
+
+        official = None
+
+        if strategy == 'official':
+            official = QFileDialog.getExistingDirectory(
+                self,
+                'Escolha a pasta cuja cópia deve ser preservada',
+            )
+
+            if not official:
+                return
+
+        try:
+            report = self.last_report
+            groups = report['duplicates']
+            persistence = report['persistence']
+            inventory = report['inventory']
+
+            # Usa as raízes registradas pelo Scanner,
+            # que já normalizou os caminhos do inventário.
+            scope = tuple(dict.fromkeys(
+                item['root']
+                for item in inventory
+            ))
+
+            inventoried = {
+                Path(item['path'])
+                for item in inventory
+            }
+
+            if any(
+                Path(record['path']) not in inventoried
+                for group in groups
+                for record in group
+            ):
+                raise SelectionError(
+                    'Um candidato não pertence '
+                    'ao inventário da análise.'
+                )
+
+            if official is not None:
+                official = Path(official).resolve(
+                    strict=True
+                )
+
+            decisions = plan_selection(
+                groups,
+                strategy=strategy,
+                scope=scope,
+                official_directory=official,
+            )
+
+            if (
+                self.tree.topLevelItemCount()
+                != len(groups)
+            ):
+                raise SelectionError(
+                    'A tabela diverge dos grupos do relatório.'
+                )
+
+            rows = []
+
+            for index, group in enumerate(groups):
                 parent = self.tree.topLevelItem(index)
-                children = [parent.child(i) for i in range(parent.childCount())]
-                dated = [child for child in children
-                         if child.data(0, Qt.ItemDataRole.UserRole + 1).get('creation_time_ns') is not None]
-                preserve = None
-                if criterio != 'limpar':
-                    if len(dated) != len(children):
-                        unavailable += 1
-                    elif children:
-                        ordered = sorted(children, key=lambda child: (
-                            child.data(0, Qt.ItemDataRole.UserRole + 1)['creation_time_ns'],
-                            str(child.data(0, Qt.ItemDataRole.UserRole)),
-                        ))
-                        preserve = ordered[-1] if criterio == 'antigos' else ordered[0]
-                for child in children:
-                    marked = preserve is not None and child is not preserve
-                    child.setCheckState(0, Qt.CheckState.Checked if marked else Qt.CheckState.Unchecked)
-        self.validar_selecao()
-        if unavailable:
+
+                children = [
+                    parent.child(i)
+                    for i in range(parent.childCount())
+                ]
+
+                if (
+                    len(children) != len(group)
+                    or [
+                        child.data(
+                            0,
+                            Qt.ItemDataRole.UserRole,
+                        )
+                        for child in children
+                    ]
+                    != [
+                        record['path']
+                        for record in group
+                    ]
+                ):
+                    raise SelectionError(
+                        'Os caminhos da tabela '
+                        'divergem do relatório.'
+                    )
+
+                rows.append((parent, children))
+
+            selection_id = str(uuid4())
+
+            blocked = sum(
+                item.reference is None
+                for item in decisions
+            )
+
+            audit_event(
+                'SMART_MARK_PLANNED',
+                selection_id=selection_id,
+                analysis_id=persistence['attempt_id'],
+                strategy=strategy,
+                official_directory=(
+                    str(official)
+                    if official else None
+                ),
+                groups=len(decisions),
+                blocked_groups=blocked,
+                references=[
+                    str(item.reference)
+                    if item.reference else None
+                    for item in decisions
+                ],
+                reasons=[
+                    item.reason
+                    for item in decisions
+                ],
+            )
+
+        except (
+            SelectionError,
+            OSError,
+            KeyError,
+            TypeError,
+        ) as error:
             self.selection_label.setText(
-                self.selection_label.text() + f' {unavailable} grupos sem todas as datas de criação: desmarcados.'
+                'Seleção não aplicada; '
+                f'marcação anterior mantida: {error}'
+            )
+            return
+
+        with QSignalBlocker(self.tree):
+            for decision, (parent, children) in zip(
+                decisions,
+                rows,
+            ):
+                parent.setData(
+                    0,
+                    Qt.ItemDataRole.UserRole + 2,
+                    decision.reference,
+                )
+                parent.setText(
+                    4,
+                    REASONS_SELECTION[decision.reason],
+                )
+                parent.setToolTip(
+                    4,
+                    str(
+                        decision.reference
+                        or REASONS_SELECTION[decision.reason]
+                    ),
+                )
+
+                for child in children:
+                    path = Path(child.data(
+                        0,
+                        Qt.ItemDataRole.UserRole,
+                    ))
+
+                    child.setCheckState(
+                        0,
+                        (
+                            Qt.CheckState.Checked
+                            if path in decision.marked
+                            else Qt.CheckState.Unchecked
+                        ),
+                    )
+
+                    child.setText(
+                        4,
+                        (
+                            'Referência preservada para revisão'
+                            if path == decision.reference
+                            else 'Exige revalidação para agir'
+                        ),
+                    )
+
+        self.validar_selecao()
+
+        self.selection_label.setText(
+            self.selection_label.text()
+            + f' {blocked} grupos sem seleção automática; '
+            'consulte os motivos nos grupos.'
+        )
+
+        try:
+            audit_event(
+                'SMART_MARK_APPLIED',
+                selection_id=selection_id,
+                analysis_id=persistence['attempt_id'],
+                strategy=strategy,
+                selected_files=sum(
+                    len(item.marked)
+                    for item in decisions
+                ),
+                blocked_groups=blocked,
+            )
+
+        except AuditError as error:
+            self.selection_label.setText(
+                self.selection_label.text()
+                + f' AUDITORIA PENDENTE: {error}'
             )
 
     def validar_selecao(self, changed_item=None, column=0):
         protected = False
+
         with QSignalBlocker(self.tree):
-            for index in range(self.tree.topLevelItemCount()):
+            for index in range(
+                self.tree.topLevelItemCount()
+            ):
                 parent = self.tree.topLevelItem(index)
-                children = [parent.child(i) for i in range(parent.childCount())]
+
+                children = [
+                    parent.child(i)
+                    for i in range(parent.childCount())
+                ]
+
                 if self._historical:
                     for child in children:
-                        child.setCheckState(0, Qt.CheckState.Unchecked)
+                        child.setCheckState(
+                            0,
+                            Qt.CheckState.Unchecked,
+                        )
                     continue
-                if children and all(child.checkState(0) == Qt.CheckState.Checked for child in children):
-                    preserve = changed_item if changed_item in children else children[-1]
-                    preserve.setCheckState(0, Qt.CheckState.Unchecked)
+
+                reference = parent.data(
+                    0,
+                    Qt.ItemDataRole.UserRole + 2,
+                )
+
+                if reference is not None:
+                    matches = [
+                        child
+                        for child in children
+                        if child.data(
+                            0,
+                            Qt.ItemDataRole.UserRole,
+                        ) == reference
+                    ]
+
+                    if len(matches) != 1:
+                        for child in children:
+                            child.setCheckState(
+                                0,
+                                Qt.CheckState.Unchecked,
+                            )
+
+                        protected = True
+                        continue
+
+                    if (
+                        matches[0].checkState(0)
+                        == Qt.CheckState.Checked
+                    ):
+                        matches[0].setCheckState(
+                            0,
+                            Qt.CheckState.Unchecked,
+                        )
+                        protected = True
+
+                if children and all(
+                    child.checkState(0)
+                    == Qt.CheckState.Checked
+                    for child in children
+                ):
+                    preserve = (
+                        changed_item
+                        if changed_item in children
+                        else children[-1]
+                    )
+
+                    preserve.setCheckState(
+                        0,
+                        Qt.CheckState.Unchecked,
+                    )
                     protected = True
+
         self.selection_label.setText(
-            f'{len(self.obter_arquivos_marcados())} arquivos marcados para revisão.'
-            + (' Mantido um arquivo desmarcado por grupo.' if protected else '')
+            f'{len(self.obter_arquivos_marcados())} '
+            'arquivos marcados para revisão.'
+            + (
+                ' Referência preservada; '
+                'grupos inconsistentes ficam desmarcados.'
+                if protected else ''
+            )
         )
+
         self._update_controls()
 
     def obter_arquivos_marcados(self):
