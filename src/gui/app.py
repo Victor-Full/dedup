@@ -4,6 +4,8 @@ from datetime import datetime, timezone
 import json
 from pathlib import Path
 from uuid import uuid4
+from utils.logger import AuditError, audit_event
+from utils.audit import OperationAuditError
 
 from PyQt6.QtCore import Qt, QThread, QSignalBlocker, QDateTime, QTimeZone, pyqtSignal
 from PyQt6.QtWidgets import (
@@ -76,7 +78,7 @@ BACKUP_NOTICE = (
 
 
 class ScanWorker(QThread):
-    """Entrega dados observados sem substituir o sinal finished do QThread."""
+    """Entrega resultados observados e preserva falhas de persistência."""
 
     progress = pyqtSignal(str)
     result_ready = pyqtSignal(dict)
@@ -84,9 +86,15 @@ class ScanWorker(QThread):
 
     def __init__(self, config, parent=None, *, report_store=None):
         super().__init__(parent)
-        self.report_store = ReportStore() if report_store is None else report_store
+
+        self.report_store = (
+            ReportStore()
+            if report_store is None else report_store
+        )
+
         config = validate_config(config)
         database = str(self.report_store.database_path)
+
         self.config = validate_config({
             **config,
             'excluded_paths': (
@@ -108,10 +116,23 @@ class ScanWorker(QThread):
         })
 
     def run(self):
+        analysis_id = str(uuid4())
+        audit_errors = []
+
         try:
+            audit_event(
+                'SCAN_STARTED',
+                analysis_id=analysis_id,
+            )
+
             started_at = datetime.now(timezone.utc).isoformat()
-            self.progress.emit('Fase 1/3: inventariando arquivos e registrando falhas...')
+
+            self.progress.emit(
+                'Fase 1/3: inventariando arquivos e registrando falhas...'
+            )
+
             config = self.config
+
             scanner = Scanner(
                 config['monitored_paths'],
                 ignored_dirs=config['ignored_dirs'],
@@ -120,56 +141,78 @@ class ScanWorker(QThread):
                 min_file_size_bytes=config['min_file_size_bytes'],
                 ignored_path_patterns=config['ignored_path_patterns'],
             )
+
             size_groups = scanner.scan_directory()
+
             self.progress.emit(
                 'Fase 2/3: prefixo de 64 KiB, SHA-256 completo e bytes; '
                 'falhas serão tratadas na recuperação final...'
             )
+
             candidates_by_size = {}
             inventory_failures = {}
 
             def prior_failures_for(groups):
                 return {
                     record['path']: inventory_failures[record['path']]
-                    for files in groups.values() for record in files
+                    for files in groups.values()
+                    for record in files
                     if record['path'] in inventory_failures
                 }
 
             def recover_candidates():
-                # O hasher chama esta função após a primeira comparação e
-                # antes de repetir o conteúdo, sem reiniciar os conhecidos.
                 pending_count = len(scanner.pending_errors)
+
                 self.progress.emit(
-                    f'Fase 3/3: recuperação final; {pending_count} locais pendentes '
-                    'no inventário; somente candidatos com tentativa restante '
+                    f'Fase 3/3: recuperação final; '
+                    f'{pending_count} locais pendentes no inventário; '
+                    'somente candidatos com tentativa restante '
                     'poderão ser repetidos...'
                 )
-                groups = scanner.retry_errors() if pending_count else size_groups
-                # A recuperação continua a tentativa após a falha individual.
-                # Não soma históricos nem atribui falhas de pasta aos filhos.
+
+                groups = (
+                    scanner.retry_errors()
+                    if pending_count else size_groups
+                )
+
                 inventory_failures.update({
                     item['path']: item['attempts'] - 1
                     for item in scanner.recovered_errors
-                    if item['stage'] == 'file' and item['resolution'] == 'INVENTORIED'
+                    if (
+                        item['stage'] == 'file'
+                        and item['resolution'] == 'INVENTORIED'
+                    )
                 })
-                # Indexa uma vez o inventário já filtrado e recuperado, incluindo
-                # tamanhos exclusivos. Não relê disco nas consultas seguintes.
+
                 for record in scanner.inventory:
-                    if (record.get('same_file_as') is None
-                            and record['size_bytes'] >= config['min_file_size_bytes']):
-                        candidates_by_size.setdefault(record['size_bytes'], []).append(record)
+                    if (
+                        record.get('same_file_as') is None
+                        and record['size_bytes']
+                        >= config['min_file_size_bytes']
+                    ):
+                        candidates_by_size.setdefault(
+                            record['size_bytes'],
+                            [],
+                        ).append(record)
+
                 return groups, prior_failures_for(groups)
 
             def candidates_for_size(size):
                 files = candidates_by_size.get(size, [])
                 groups = {size: files} if files else {}
+
                 return groups, prior_failures_for(groups)
 
-            hasher = Hasher(chunk_size=config['chunk_size_bytes'])
+            hasher = Hasher(
+                chunk_size=config['chunk_size_bytes']
+            )
+
             duplicates = hasher.find_duplicates(
-                size_groups, recover_candidates=recover_candidates,
+                size_groups,
+                recover_candidates=recover_candidates,
                 candidates_for_size=candidates_for_size,
             )
+
             report = {
                 'duplicates': duplicates,
                 'inventory': scanner.inventory,
@@ -184,36 +227,107 @@ class ScanWorker(QThread):
                 'recovered_files': hasher.recovered_files,
                 'summary': hasher.summary,
             }
+
             finished_at = datetime.now(timezone.utc).isoformat()
-            self.progress.emit('Salvando relatório da análise...')
-            attempt_id = str(uuid4())
+
+            self.progress.emit(
+                'Salvando relatório da análise...'
+            )
+
+            attempt_id = analysis_id
+
+            # Registra o término da análise separadamente
+            # da tentativa de gravar o relatório.
+            try:
+                audit_event(
+                    'SCAN_COMPLETED',
+                    analysis_id=analysis_id,
+                    inventory_files=len(scanner.inventory),
+                    duplicate_groups=len(duplicates),
+                    pending_files=len(hasher.pending_files),
+                    pending_locations=len(scanner.pending_errors),
+                )
+
+            except AuditError as audit_error:
+                audit_errors.append(str(audit_error))
+
             try:
                 report_id = self.report_store.save_report(
-                    report, config, started_at=started_at, finished_at=finished_at,
+                    report,
+                    config,
+                    started_at=started_at,
+                    finished_at=finished_at,
                     report_id=attempt_id,
                 )
-                persistence = {'saved': True, 'report_id': report_id, 'error': None}
+
+                persistence = {
+                    'saved': True,
+                    'report_id': report_id,
+                    'error': None,
+                }
+
+            except OperationAuditError as error:
+                audit_errors.append(str(error))
+
+                persistence = {
+                    'saved': error.completed,
+                    'report_id': (
+                        error.result
+                        if error.completed else None
+                    ),
+                    'error': (
+                        None
+                        if error.completed else str(error)
+                    ),
+                }
+
             except Exception as error:
-                # A análise concluída continua disponível mesmo se o banco
-                # falhar. Não publica um sucesso de gravação inexistente.
-                persistence = {'saved': False, 'report_id': None,
-                               'error': f'{type(error).__name__}: {error}'}
+                if isinstance(error, AuditError):
+                    audit_errors.append(str(error))
+
+                persistence = {
+                    'saved': False,
+                    'report_id': None,
+                    'error': f'{type(error).__name__}: {error}',
+                }
+
             report['persistence'] = {
-                **persistence, 'started_at': started_at, 'finished_at': finished_at,
-                'attempt_id': attempt_id, 'config': config, 'save_attempts': 1,
+                **persistence,
+                'started_at': started_at,
+                'finished_at': finished_at,
+                'attempt_id': attempt_id,
+                'config': config,
+                'save_attempts': 1,
+                'audit_error': ' | '.join(audit_errors) or None,
             }
+
             self.result_ready.emit(report)
+
         except Exception as error:
-            self.error.emit(f'{type(error).__name__}: {error}')
+            message = f'{type(error).__name__}: {error}'
+
+            try:
+                audit_event(
+                    'SCAN_FAILED',
+                    analysis_id=analysis_id,
+                    error_type=type(error).__name__,
+                    error=str(error),
+                )
+
+            except AuditError as audit_error:
+                message += f' | Auditoria: {audit_error}'
+
+            self.error.emit(message)
 
 
 class ReportSaveWorker(QThread):
-    """Repete apenas a gravação do snapshot da sessão, sem reler as origens."""
+    """Repete a gravação do snapshot sem reler os arquivos de origem."""
 
     result_ready = pyqtSignal(dict)
 
     def __init__(self, report_store, report, parent=None):
         super().__init__(parent)
+
         self.report_store = report_store
         self.report = report
 
@@ -221,133 +335,312 @@ class ReportSaveWorker(QThread):
     def _json_path(value):
         if isinstance(value, Path):
             return str(value)
-        raise TypeError(f'Tipo não suportado no relatório: {type(value).__name__}.')
+
+        raise TypeError(
+            f'Tipo não suportado no relatório: '
+            f'{type(value).__name__}.'
+        )
 
     def run(self):
         persistence = dict(self.report['persistence'])
-        persistence['save_attempts'] = persistence.get('save_attempts', 1) + 1
+
+        persistence['save_attempts'] = (
+            persistence.get('save_attempts', 1) + 1
+        )
+        persistence['audit_error'] = None
+
         try:
-            # Metadados de apresentação/gravação não pertencem ao snapshot
-            # original. Preserva conteúdo, configuração efetiva e período.
-            report = {key: value for key, value in self.report.items() if key != 'persistence'}
-            config = validate_config(persistence['config'])
+            report = {
+                key: value
+                for key, value in self.report.items()
+                if key != 'persistence'
+            }
+
+            config = validate_config(
+                persistence['config']
+            )
             identifier = persistence['attempt_id']
+
             try:
                 self.report_store.save_report(
-                    report, config, started_at=persistence['started_at'],
-                    finished_at=persistence['finished_at'], report_id=identifier,
+                    report,
+                    config,
+                    started_at=persistence['started_at'],
+                    finished_at=persistence['finished_at'],
+                    report_id=identifier,
                 )
+
             except Exception as save_error:
-                # Um retorno falho pode ocorrer depois do commit. Só reconhece
-                # o UUID como salvo se a leitura íntegra for do mesmo snapshot.
+                if isinstance(save_error, AuditError):
+                    persistence['audit_error'] = str(save_error)
+
+                # A falha pode ter ocorrido depois do commit.
+                # Só reconhece o registro existente se o
+                # snapshot completo corresponder ao esperado.
                 try:
-                    existing = self.report_store.get_report(identifier)
+                    existing = self.report_store.get_report(
+                        identifier
+                    )
+
                 except Exception as read_error:
                     raise ReportStoreError(
-                        f'Falha ao salvar: {save_error}. Não foi possível confirmar '
-                        f'o identificador no banco: {read_error}'
+                        f'Falha ao salvar: {save_error}. '
+                        'Não foi possível confirmar o '
+                        f'identificador no banco: {read_error}'
                     ) from save_error
+
                 expected = json.loads(json.dumps(
-                    report, default=self._json_path, ensure_ascii=False, allow_nan=False,
+                    report,
+                    default=self._json_path,
+                    ensure_ascii=False,
+                    allow_nan=False,
                 ))
-                if (existing['report'] != expected or existing['config'] != config
-                        or existing['started_at'] != persistence['started_at']
-                        or existing['finished_at'] != persistence['finished_at']):
+
+                if (
+                    existing['report'] != expected
+                    or existing['config'] != config
+                    or existing['started_at']
+                    != persistence['started_at']
+                    or existing['finished_at']
+                    != persistence['finished_at']
+                ):
                     raise ReportStoreError(
-                        'O identificador já pertence a um snapshot diferente; nenhum registro foi substituído.'
+                        'O identificador já pertence a um '
+                        'snapshot diferente; nenhum registro '
+                        'foi substituído.'
                     ) from save_error
-            persistence.update(saved=True, report_id=identifier, error=None)
+
+            persistence.update(
+                saved=True,
+                report_id=identifier,
+                error=None,
+            )
+
         except Exception as error:
-            persistence.update(saved=False, report_id=None, error=f'{type(error).__name__}: {error}')
+            persistence.update(
+                saved=False,
+                report_id=None,
+                error=f'{type(error).__name__}: {error}',
+            )
+
+            if isinstance(error, AuditError):
+                persistence['audit_error'] = str(error)
+
         self.result_ready.emit(persistence)
 
 
 class BackupWorker(QThread):
-    """Copia versões selecionadas sem alterar o relatório ou remover origens."""
+    """Copia versões selecionadas sem remover os arquivos de origem."""
 
     progress = pyqtSignal(str)
     item_ready = pyqtSignal(dict)
     result_ready = pyqtSignal(dict)
     error = pyqtSignal(str)
 
-    def __init__(self, config, records, parent=None, *, analysis_id=None):
+    def __init__(
+        self,
+        config,
+        records,
+        parent=None,
+        *,
+        analysis_id=None,
+    ):
         super().__init__(parent)
+
         self.config = validate_config(config)
-        if not isinstance(records, (list, tuple)) or not records:
-            raise ValueError('Selecione arquivos de uma análise da sessão.')
-        prepared, seen = [], set()
+
+        if (
+            not isinstance(records, (list, tuple))
+            or not records
+        ):
+            raise ValueError(
+                'Selecione arquivos de uma análise da sessão.'
+            )
+
+        prepared = []
+        seen = set()
+
         for record in records:
             if not isinstance(record, dict):
-                raise ValueError('Cada arquivo deve ter um registro da análise.')
+                raise ValueError(
+                    'Cada arquivo deve ter um registro da análise.'
+                )
+
             path = Path(record['path'])
             digest = record.get('hash')
             signature = record.get('read_signature')
-            if (not path.is_absolute() or path in seen
-                    or record.get('analysis_status') != 'MATCH_OBSERVED'
-                    or record.get('same_file_as') is not None
-                    or not isinstance(digest, str) or len(digest) != 64
-                    or any(c not in '0123456789abcdef' for c in digest)
-                    or not isinstance(signature, (list, tuple)) or len(signature) != 5
-                    or any(type(value) is not int for value in signature[:4])
-                    or (signature[4] is not None and type(signature[4]) is not int)
-                    or signature[1] == 0 or signature[2] < 0
-                    or signature[2] != record.get('size_bytes')
-                    or signature[3] != record.get('modified_time_ns')):
-                raise ValueError('Arquivo sem evidência completa da versão analisada ou repetido na seleção.')
+
+            if (
+                not path.is_absolute()
+                or path in seen
+                or record.get('analysis_status')
+                != 'MATCH_OBSERVED'
+                or record.get('same_file_as') is not None
+                or not isinstance(digest, str)
+                or len(digest) != 64
+                or any(
+                    character not in '0123456789abcdef'
+                    for character in digest
+                )
+                or not isinstance(signature, (list, tuple))
+                or len(signature) != 5
+                or any(
+                    type(value) is not int
+                    for value in signature[:4]
+                )
+                or (
+                    signature[4] is not None
+                    and type(signature[4]) is not int
+                )
+                or signature[1] == 0
+                or signature[2] < 0
+                or signature[2] != record.get('size_bytes')
+                or signature[3]
+                != record.get('modified_time_ns')
+            ):
+                raise ValueError(
+                    'Arquivo sem evidência completa da versão '
+                    'analisada ou repetido na seleção.'
+                )
+
             seen.add(path)
-            prepared.append({'path': path, 'hash': digest, 'read_signature': tuple(signature)})
-        # Captura somente valores independentes da árvore/relatório mutáveis.
+
+            prepared.append({
+                'path': path,
+                'hash': digest,
+                'read_signature': tuple(signature),
+            })
+
+        # O construtor apenas prepara os dados.
+        # As operações começam em run(), após worker.start().
         self.records = tuple(prepared)
         self.analysis_id = analysis_id
         self.run_id = str(uuid4())
 
     def run(self):
         try:
-            manager = ActionManager(self.config['backup_path'], chunk_size=self.config['chunk_size_bytes'])
+            manager = ActionManager(
+                self.config['backup_path'],
+                chunk_size=self.config['chunk_size_bytes'],
+                analysis_id=self.analysis_id,
+            )
+
         except Exception as error:
-            self.error.emit(f'{type(error).__name__}: {error}')
+            self.error.emit(
+                f'{type(error).__name__}: {error}'
+            )
             return
+
         saved = 0
+        attempted = 0
+        audit_failed = False
+
         for index, record in enumerate(self.records, 1):
-            self.progress.emit(f"Backup de conteúdo {index}/{len(self.records)}: {record['path']}")
+            attempted += 1
+
+            self.progress.emit(
+                f"Backup de conteúdo {index}/{len(self.records)}: "
+                f"{record['path']}"
+            )
+
             result = {
-                'run_id': self.run_id, 'analysis_id': self.analysis_id,
-                'source_path': record['path'], 'expected_sha256': record['hash'],
-                'source_signature': record['read_signature'], 'backup_path': None,
-                'operation_dir': None, 'partial_path': None, 'status': 'FAILED',
-                'error': None, 'metadata_scope': 'MAIN_DATA_STREAM_ONLY',
+                'run_id': self.run_id,
+                'analysis_id': self.analysis_id,
+                'source_path': record['path'],
+                'expected_sha256': record['hash'],
+                'source_signature': record['read_signature'],
+                'backup_path': None,
+                'operation_dir': None,
+                'partial_path': None,
+                'status': 'FAILED',
+                'error': None,
+                'audit_error': None,
+                'metadata_scope': 'MAIN_DATA_STREAM_ONLY',
                 'deletion_authorized': False,
             }
+
             try:
-                path = manager.backup_file(
-                    record['path'], expected_sha256=record['hash'],
-                    expected_signature=record['read_signature'],
+                try:
+                    path = manager.backup_file(
+                        record['path'],
+                        expected_sha256=record['hash'],
+                        expected_signature=record['read_signature'],
+                    )
+
+                except OperationAuditError as error:
+                    if not error.completed:
+                        raise
+
+                    path = Path(error.result)
+                    result['audit_error'] = str(error)
+                    audit_failed = True
+
+                result.update(
+                    backup_path=path,
+                    operation_dir=path.parent,
                 )
-                result.update(backup_path=path, operation_dir=path.parent)
+
                 receipt = manager.verify_backup(path)
-                if (receipt['sha256'] != record['hash']
-                        or receipt['size_bytes'] != record['read_signature'][2]
-                        or Path(receipt['backup_path']) != path
-                        or tuple(receipt['source_signature']) != record['read_signature']
-                        or Path(receipt['source_path']) != record['path']
-                        or receipt['metadata_scope'] != 'MAIN_DATA_STREAM_ONLY'
-                        or receipt['deletion_authorized'] is not False):
-                    raise BackupError('O recibo do backup diverge da versão selecionada.')
-                result['status'] = 'CONTENT_VERIFIED'
+
+                if (
+                    receipt['sha256'] != record['hash']
+                    or receipt['size_bytes']
+                    != record['read_signature'][2]
+                    or Path(receipt['backup_path']) != path
+                    or tuple(receipt['source_signature'])
+                    != record['read_signature']
+                    or Path(receipt['source_path'])
+                    != record['path']
+                    or receipt['metadata_scope']
+                    != 'MAIN_DATA_STREAM_ONLY'
+                    or receipt['deletion_authorized'] is not False
+                ):
+                    raise BackupError(
+                        'O recibo do backup diverge da versão selecionada.'
+                    )
+
+                result['status'] = (
+                    'CONTENT_VERIFIED_AUDIT_FAILED'
+                    if result['audit_error']
+                    else 'CONTENT_VERIFIED'
+                )
                 saved += 1
+
             except Exception as error:
+                if isinstance(error, AuditError):
+                    audit_failed = True
+                    result['audit_error'] = str(error)
+
                 result.update(
                     error=f'{type(error).__name__}: {error}',
-                    operation_dir=getattr(error, 'operation_dir', None) or result['operation_dir'],
-                    partial_path=getattr(error, 'partial_path', None),
+                    operation_dir=(
+                        getattr(error, 'operation_dir', None)
+                        or result['operation_dir']
+                    ),
+                    partial_path=getattr(
+                        error,
+                        'partial_path',
+                        None,
+                    ),
                 )
-            result['occurred_at'] = datetime.now(timezone.utc).isoformat()
-            self.item_ready.emit(result)
-        self.result_ready.emit({
-            'run_id': self.run_id, 'total': len(self.records),
-            'saved': saved, 'failed': len(self.records) - saved,
-        })
 
+            result['occurred_at'] = datetime.now(
+                timezone.utc
+            ).isoformat()
+
+            self.item_ready.emit(result)
+
+            if audit_failed:
+                break
+
+        self.result_ready.emit({
+            'run_id': self.run_id,
+            'total': len(self.records),
+            'saved': saved,
+            'failed': attempted - saved,
+            'not_started': len(self.records) - attempted,
+            'audit_failed': audit_failed,
+        })
 
 class HistoryWorker(QThread):
     """Consulta o banco fora da thread gráfica, sem abrir arquivos de origem."""
@@ -586,6 +879,29 @@ class DedupApp(QMainWindow):
             raise ValueError('Seleção não pertence aos grupos da análise atual.')
         return records
 
+    def _has_unsaved_report(self):
+        if self._historical or self.last_report is None:
+            return False
+
+        persistence = self.last_report.get('persistence')
+
+        return (
+            not isinstance(persistence, dict)
+            or persistence.get('saved') is not True
+        )
+
+    def _allow_report_change(self):
+        if not self._has_unsaved_report():
+            return True
+
+        self.persistence_label.setText(
+            'Relatório ainda não salvo. Use "Tentar salvar novamente" '
+            'e confirme a gravação antes de iniciar outra análise, '
+            'abrir outro relatório ou fechar a janela.'
+        )
+
+        return False
+
     def _can_retry_save(self):
         if self._historical or self.last_report is None:
             return False
@@ -601,14 +917,14 @@ class DedupApp(QMainWindow):
         self.list_folders.setEnabled(available)
         self.btn_add_folder.setEnabled(available)
         self.btn_remove_folder.setEnabled(available)
-        self.btn_start_scan.setEnabled(available and self.list_folders.count() > 0)
+        self.btn_start_scan.setEnabled(available and not self._has_unsaved_report() and self.list_folders.count() > 0)
         self.btn_smart_select.setEnabled(available and not self._historical and self.tree.topLevelItemCount() > 0)
         self.tree.setEnabled(idle)
         self.history_tree.setEnabled(idle)
         self.btn_history_refresh.setEnabled(idle)
         self.btn_history_previous.setEnabled(idle and self._history_offset > 0)
         self.btn_history_next.setEnabled(idle and self._history_has_more)
-        self.btn_history_open.setEnabled(idle and bool(self.history_tree.selectedItems()))
+        self.btn_history_open.setEnabled(idle and not self._has_unsaved_report() and bool(self.history_tree.selectedItems()))
         self.btn_retry_save.setEnabled(idle and self._can_retry_save())
         self.btn_backup.setEnabled(
             idle and not self._historical and self.last_report is not None
@@ -646,6 +962,10 @@ class DedupApp(QMainWindow):
     def iniciar_varredura(self):
         if self._busy() or self.config is None:
             return
+
+        if not self._allow_report_change():
+            return
+        
         paths = [self.list_folders.item(i).text() for i in range(self.list_folders.count())]
         if not paths:
             self.status_label.setText('Adicione pelo menos uma pasta para analisar.')
@@ -671,6 +991,8 @@ class DedupApp(QMainWindow):
         worker.start()
 
     def _clear_report(self):
+        if not self._allow_report_change():
+            return
         self.last_report = None
         self.last_snapshot = None
         self.last_report_id = None
@@ -726,9 +1048,16 @@ class DedupApp(QMainWindow):
         location = result['backup_path'] or result['partial_path'] or result['operation_dir']
         item = QTreeWidgetItem(self.backup_tree, [
             str(result['source_path']),
-            'Conteúdo validado' if result['status'] == 'CONTENT_VERIFIED' else 'Falhou; nenhuma remoção executada',
+            (
+            'Conteúdo validado; auditoria pendente' 
+            if result['status'] == 'CONTENT_VERIFIED_AUDIT_FAILED' 
+            else 'Conteúdo validado'
+            if result['status'] == 'CONTENT_VERIFIED' 
+            else 'Falhou; nenhuma remoção executada'
+            ),
             str(location) if location is not None else 'Nenhum artefato informado',
-            result['error'] or '', result['occurred_at'],
+            result['error'] or result.get('audit_error') or '',
+            result['occurred_at'],
         ])
         item.setData(0, Qt.ItemDataRole.UserRole, dict(result))
         for column in (0, 2, 3):
@@ -736,8 +1065,14 @@ class DedupApp(QMainWindow):
 
     def _backup_result(self, result):
         self.backup_label.setText(
-            f"Backup de conteúdo concluído: {result['saved']}/{result['total']} validados; "
-            f"{result['failed']} falhas. Consulte os motivos e artefatos na aba de backups. {BACKUP_NOTICE}"
+            f"Backup de conteúdo concluído: "
+            f"{result['saved']}/{result['total']} validados; "
+            f"{result['failed']} falhas; "
+            f"{result.get('not_started', 0)} não iniciados; "
+            f"falha de auditoria: "
+            f"{'sim' if result.get('audit_failed') else 'não'}. "
+            f"Consulte os motivos e artefatos na aba de backups. "
+            f"{BACKUP_NOTICE}"
         )
 
     def _backup_error(self, message):
@@ -751,6 +1086,10 @@ class DedupApp(QMainWindow):
     def abrir_relatorio_historico(self):
         if self._busy():
             return
+
+        if not self._allow_report_change():
+            return
+        
         selected = self.history_tree.selectedItems()
         if selected:
             identifier = selected[0].data(0, Qt.ItemDataRole.UserRole)
@@ -799,6 +1138,9 @@ class DedupApp(QMainWindow):
 
     def _history_result(self, result):
         if 'snapshot' in result:
+            if not self._allow_report_change():
+                return
+            
             snapshot = result['snapshot']
             try:
                 self.apresentar_relatorio(snapshot['report'], snapshot=snapshot)
@@ -913,7 +1255,20 @@ class DedupApp(QMainWindow):
         else:
             self.persistence_label.setText('Relatório desta sessão; gravação não informada.')
 
+        if persistence.get('audit_error'):
+            self.persistence_label.setText(
+                self.persistence_label.text()
+                + ' AUDITORIA PENDENTE: '
+                + persistence['audit_error']
+            )
+
     def apresentar_relatorio(self, report, *, snapshot=None):
+        if(
+            report is not self.last_report
+            and not self._allow_report_change()
+        ):
+            return
+        
         self._historical = snapshot is not None
         self.last_snapshot = snapshot
         self.last_report = report
@@ -1105,4 +1460,9 @@ class DedupApp(QMainWindow):
                 self.status_label.setText('Aguarde a análise terminar para fechar a janela.')
             event.ignore()
             return
+
+        if not self._allow_report_change():
+            event.ignore()
+            return
+        
         super().closeEvent(event)

@@ -14,6 +14,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import UUID, uuid4
+from utils.audit import audited_operation
 
 from utils.config_parser import ConfigError, validate_config
 
@@ -206,6 +207,7 @@ class ReportStore:
             raise ReportStoreError('Versão do banco de relatórios incompatível; banco preservado.')
         return True
 
+    @audited_operation("REPORT_SAVE")
     def save_report(self, report, config, *, started_at, finished_at, report_id=None):
         """Insere um snapshot completo e imutável pelo identificador; nunca sobrescreve.
 

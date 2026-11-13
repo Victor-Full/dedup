@@ -6,17 +6,17 @@ ADS e restauração de metadados Windows ainda não estão cobertos.
 """
 
 import ctypes
-from ctypes import wintypes
-from contextlib import contextmanager, ExitStack
-from datetime import datetime, timezone
+import stat
 import hashlib
 import json
 import logging
 import os
 from pathlib import Path
-import stat
 from uuid import UUID, uuid4
-
+from ctypes import wintypes
+from contextlib import contextmanager, ExitStack
+from datetime import datetime, timezone
+from utils.audit import audited_operation
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DATA_NAME = 'content.bin'
@@ -58,11 +58,12 @@ def _reject_constant(value):
 
 
 class ActionManager:
-    def __init__(self, backup_dir, logger=None, *, chunk_size=65536):
+    def __init__(self, backup_dir, logger=None, *, chunk_size=65536, analysis_id=None):
         if not isinstance(chunk_size, int) or isinstance(chunk_size, bool) or chunk_size <= 0:
             raise BackupError('O tamanho do bloco deve ser um inteiro positivo.')
         self.backup_dir = self._path(backup_dir, relative=True)
         self.chunk_size = chunk_size
+        self.analysis_id = analysis_id
         self.logger = logger or logging.getLogger('dedup_audit')
 
     @staticmethod
@@ -257,6 +258,7 @@ class ActionManager:
             os.fsync(stream.fileno())
         return hashlib.sha256(raw).hexdigest()
 
+    @audited_operation("BACKUP_CONTENT")
     def backup_file(self, file_path, *, expected_sha256=None, expected_signature=None):
         """Copia/valida o conteúdo principal e retorna content.bin, sem remover.
 
@@ -311,7 +313,6 @@ class ActionManager:
                     'sha256': digest, 'operation_sha256': operation_digest, 'verified_at': _now(),
                 }
                 self._write_manifest(operation_dir / VERIFIED_NAME, verified)
-            self.logger.info('BACKUP_CONTENT_VERIFIED: %s -> %s', source_path, data_path)
             return data_path
         except (OSError, BackupError, ValueError, TypeError) as error:
             raise BackupError(
@@ -379,6 +380,7 @@ class ActionManager:
         with self._verified_backup(backup_path) as (_, receipt):
             return receipt
 
+    @audited_operation("RESTORE_CONTENT")
     def restore_backup(self, backup_path, destination):
         """Restaura conteúdo para novo arquivo; nunca substitui um existente.
 
@@ -394,7 +396,6 @@ class ActionManager:
                 with self._protected(destination, create=True) as target:
                     partial_path = destination
                     self._copy_and_verify(source, target, expected_sha256=receipt['sha256'])
-            self.logger.info('RESTORE_CONTENT_VERIFIED: %s -> %s', backup_path, destination)
             return destination
         except (OSError, BackupError, ValueError, TypeError) as error:
             partial_path = partial_path or getattr(error, 'partial_path', None)
