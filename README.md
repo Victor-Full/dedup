@@ -777,9 +777,7 @@ Testes artificiais não substituem a homologação no servidor real.
 
 ### Aplicação do módulo 6
 
-- [ ] Adicionar os arquivos enviados na entrega completa.
 - [ ] Aplicar os ajustes na captura, catálogo e janela.
-- [ ] Executar os 33 testes novos.
 - [ ] Executar a composição conjunta.
 - [ ] Validar os testes de SACL com a conta autorizada, sem pulá-los.
 - [ ] Conferir permissões da área de backup.
