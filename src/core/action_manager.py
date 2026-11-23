@@ -17,6 +17,7 @@ from ctypes import wintypes
 from contextlib import contextmanager, ExitStack
 from datetime import datetime, timezone
 from utils.audit import audited_operation
+from core.run_lock import exclusive
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DATA_NAME = 'content.bin'
@@ -258,6 +259,7 @@ class ActionManager:
             os.fsync(stream.fileno())
         return hashlib.sha256(raw).hexdigest()
 
+    @exclusive
     @audited_operation("BACKUP_CONTENT")
     def backup_file(self, file_path, *, expected_sha256=None, expected_signature=None):
         """Copia/valida o conteúdo principal e retorna content.bin, sem remover.
@@ -380,6 +382,7 @@ class ActionManager:
         with self._verified_backup(backup_path) as (_, receipt):
             return receipt
 
+    @exclusive
     @audited_operation("RESTORE_CONTENT")
     def restore_backup(self, backup_path, destination):
         """Restaura conteúdo para novo arquivo; nunca substitui um existente.

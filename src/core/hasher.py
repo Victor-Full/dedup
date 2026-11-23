@@ -28,9 +28,10 @@ class _ReadFailure(Exception):
 
 
 class Hasher:
-    def __init__(self, chunk_size: int = 65536):
+    def __init__(self, chunk_size: int = 65536, *, check_cancel=None,):
         if not isinstance(chunk_size, int) or isinstance(chunk_size, bool) or chunk_size <= 0:
             raise ValueError('O tamanho do bloco deve ser um inteiro positivo.')
+        self._check_cancel = check_cancel or (lambda: None)
         self.chunk_size = chunk_size
         self.records: List[Dict] = []
         self.errors: List[Dict] = []
@@ -76,6 +77,7 @@ class Hasher:
         return _ReadFailure(path, reason, str(error), error)
 
     def _path_info(self, path: Path) -> os.stat_result:
+        self._check_cancel()
         try:
             info = path.stat(follow_symlinks=False)
         except OSError as error:
@@ -120,6 +122,7 @@ class Hasher:
     def _read(self, stream, path: Path, count: int) -> bytes:
         # Atribui uma falha de leitura ao arquivo correto, mesmo com dois
         # contextos de leitura abertos durante uma comparação.
+        self._check_cancel()
         try:
             return stream.read(count)
         except OSError as error:
@@ -474,7 +477,13 @@ class Hasher:
 
             # Um candidato recuperado pode promover um prefixo
             # que já estava aguardando um par.
-            for candidate in list(bucket):
+            candidates = (
+                list(bucket)
+                if len(bucket) == 2
+                else (record,)
+            )
+
+            for candidate in candidates:
                 if 'hash' in candidate:
                     continue
 

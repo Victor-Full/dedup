@@ -75,8 +75,32 @@ class AuditFormatter(logging.Formatter):
 
 
 class StrictAuditHandler(RotatingFileHandler):
+    def _repair_tail(self):
+        offset = getattr(
+            self,
+            "_rollback_offset",
+            None,
+        )
+
+        if offset is None:
+            return
+
+        if self.stream is None:
+            self.stream = self._open()
+
+        self.stream.seek(offset)
+        self.stream.truncate()
+        self.stream.flush()
+        os.fsync(self.stream.fileno())
+
+        self._rollback_offset = None
+
     def emit(self, record):
+        offset = None
+
         try:
+            self._repair_tail()
+
             raw = self.format(record)
 
             if self.shouldRollover(record):
@@ -85,20 +109,43 @@ class StrictAuditHandler(RotatingFileHandler):
             if self.stream is None:
                 self.stream = self._open()
 
+            offset = self.stream.tell()
             line = raw + self.terminator
 
             if self.stream.write(line) != len(line):
                 raise OSError(
-                    "Gravação incompleta do evento de auditoria."
+                    "Gravação incompleta "
+                    "do evento de auditoria."
                 )
 
             self.stream.flush()
             os.fsync(self.stream.fileno())
 
-        except Exception as error:
+        except BaseException as error:
+            interrupted = not isinstance(
+                error,
+                Exception,
+            )
+            detail = str(error)
+
+            if offset is not None:
+                self._rollback_offset = offset
+
+                try:
+                    self._repair_tail()
+
+                except BaseException as repair_error:
+                    detail += (
+                        "; recuperação do log pendente: "
+                        f"{repair_error}"
+                    )
+
+            if interrupted:
+                raise
+
             raise AuditError(
-                f"Falha ao gravar a auditoria em "
-                f"{self.baseFilename}: {error}"
+                "Falha ao gravar a auditoria em "
+                f"{self.baseFilename}: {detail}"
             ) from error
 
     def doRollover(self):
@@ -106,17 +153,20 @@ class StrictAuditHandler(RotatingFileHandler):
             self.stream.close()
             self.stream = None
 
-        stamp = datetime.now(timezone.utc).strftime(
-            "%Y%m%dT%H%M%S%fZ"
-        )
+        stamp = datetime.now(
+            timezone.utc
+        ).strftime("%Y%m%dT%H%M%S%fZ")
 
         archive = (
             self.baseFilename
             + f".{stamp}.{uuid4().hex}.archive"
         )
 
-        # Não elimina arquivos antigos automaticamente.
-        os.rename(self.baseFilename, archive)
+        os.rename(
+            self.baseFilename,
+            archive,
+        )
+
         self.stream = self._open()
 
 

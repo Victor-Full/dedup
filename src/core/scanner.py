@@ -31,6 +31,7 @@ class Scanner:
         excluded_paths: Optional[List[str]] = None,
         min_file_size_bytes: int = 1,
         ignored_path_patterns=None,
+        check_cancel=None,
     ):
         if (
             type(min_file_size_bytes) is not int
@@ -39,7 +40,8 @@ class Scanner:
             raise ValueError(
                 'O tamanho mínimo não pode ser negativo.'
             )
-
+        
+        self._check_cancel = check_cancel or (lambda: None)
         self.target_dirs = list(target_dirs)
 
         self.ignored_dirs = {
@@ -120,6 +122,7 @@ class Scanner:
         return bool(getattr(info, 'st_file_attributes', 0) & mask)
 
     def _touch(self, path):
+        self._check_cancel()
         key = self._path_key(path)
         if self._retrying and key in self._failed and key not in self._processed_retry:
             self._attempts[key] = 2

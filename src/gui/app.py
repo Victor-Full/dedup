@@ -1,11 +1,13 @@
 """Interface de análise. Ações destrutivas aguardam o executor seguro."""
 
-from datetime import datetime, timezone
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
 from utils.logger import AuditError, audit_event
 from utils.audit import OperationAuditError
+from core.analysis import run_analysis
+from gui.manual import ManualControls, checkpoint_matches
 
 from PyQt6.QtCore import Qt, QThread, QSignalBlocker, QDateTime, QTimeZone, pyqtSignal
 from PyQt6.QtWidgets import (
@@ -84,18 +86,25 @@ BACKUP_NOTICE = (
 
 
 class ScanWorker(QThread):
-    """Entrega resultados observados e preserva falhas de persistência."""
+    """Compatibilidade com os fluxos de análise existentes."""
 
     progress = pyqtSignal(str)
     result_ready = pyqtSignal(dict)
     error = pyqtSignal(str)
 
-    def __init__(self, config, parent=None, *, report_store=None):
+    def __init__(
+        self,
+        config,
+        parent=None,
+        *,
+        report_store=None,
+    ):
         super().__init__(parent)
 
         self.report_store = (
             ReportStore()
-            if report_store is None else report_store
+            if report_store is None
+            else report_store
         )
 
         config = validate_config(config)
@@ -103,227 +112,43 @@ class ScanWorker(QThread):
 
         self.config = validate_config({
             **config,
-            'excluded_paths': (
-                config['excluded_paths']
+            "excluded_paths": (
+                config["excluded_paths"]
                 + [
                     database + suffix
                     for suffix in (
-                        '',
-                        '-journal',
-                        '-wal',
-                        '-shm',
+                        "",
+                        "-journal",
+                        "-wal",
+                        "-shm",
                     )
                 ]
                 + [
                     str(CONFIG_PATH),
-                    str(PROJECT_ROOT / 'logs'),
+                    str(PROJECT_ROOT / "logs"),
                 ]
             ),
         })
 
     def run(self):
-        analysis_id = str(uuid4())
-        audit_errors = []
-
         try:
-            audit_event(
-                'SCAN_STARTED',
-                analysis_id=analysis_id,
+            report = run_analysis(
+                self.config,
+                report_store=self.report_store,
+                progress=self.progress.emit,
             )
-
-            started_at = datetime.now(timezone.utc).isoformat()
-
-            self.progress.emit(
-                'Fase 1/3: inventariando arquivos e registrando falhas...'
-            )
-
-            config = self.config
-
-            scanner = Scanner(
-                config['monitored_paths'],
-                ignored_dirs=config['ignored_dirs'],
-                ignored_exts=config['ignored_exts'],
-                excluded_paths=config['excluded_paths'],
-                min_file_size_bytes=config['min_file_size_bytes'],
-                ignored_path_patterns=config['ignored_path_patterns'],
-            )
-
-            size_groups = scanner.scan_directory()
-
-            self.progress.emit(
-                'Fase 2/3: prefixo de 64 KiB, SHA-256 completo e bytes; '
-                'falhas serão tratadas na recuperação final...'
-            )
-
-            candidates_by_size = {}
-            inventory_failures = {}
-
-            def prior_failures_for(groups):
-                return {
-                    record['path']: inventory_failures[record['path']]
-                    for files in groups.values()
-                    for record in files
-                    if record['path'] in inventory_failures
-                }
-
-            def recover_candidates():
-                pending_count = len(scanner.pending_errors)
-
-                self.progress.emit(
-                    f'Fase 3/3: recuperação final; '
-                    f'{pending_count} locais pendentes no inventário; '
-                    'somente candidatos com tentativa restante '
-                    'poderão ser repetidos...'
-                )
-
-                groups = (
-                    scanner.retry_errors()
-                    if pending_count else size_groups
-                )
-
-                inventory_failures.update({
-                    item['path']: item['attempts'] - 1
-                    for item in scanner.recovered_errors
-                    if (
-                        item['stage'] == 'file'
-                        and item['resolution'] == 'INVENTORIED'
-                    )
-                })
-
-                for record in scanner.inventory:
-                    if (
-                        record.get('same_file_as') is None
-                        and record['size_bytes']
-                        >= config['min_file_size_bytes']
-                    ):
-                        candidates_by_size.setdefault(
-                            record['size_bytes'],
-                            [],
-                        ).append(record)
-
-                return groups, prior_failures_for(groups)
-
-            def candidates_for_size(size):
-                files = candidates_by_size.get(size, [])
-                groups = {size: files} if files else {}
-
-                return groups, prior_failures_for(groups)
-
-            hasher = Hasher(
-                chunk_size=config['chunk_size_bytes']
-            )
-
-            duplicates = hasher.find_duplicates(
-                size_groups,
-                recover_candidates=recover_candidates,
-                candidates_for_size=candidates_for_size,
-            )
-
-            report = {
-                'duplicates': duplicates,
-                'inventory': scanner.inventory,
-                'scan_errors': scanner.errors,
-                'scan_pending_errors': scanner.pending_errors,
-                'scan_recovered_errors': scanner.recovered_errors,
-                'scan_summary': scanner.summary,
-                'skipped': scanner.skipped,
-                'records': hasher.records,
-                'comparison_errors': hasher.errors,
-                'pending_files': hasher.pending_files,
-                'recovered_files': hasher.recovered_files,
-                'summary': hasher.summary,
-            }
-
-            finished_at = datetime.now(timezone.utc).isoformat()
-
-            self.progress.emit(
-                'Salvando relatório da análise...'
-            )
-
-            attempt_id = analysis_id
-
-            # Registra o término da análise separadamente
-            # da tentativa de gravar o relatório.
-            try:
-                audit_event(
-                    'SCAN_COMPLETED',
-                    analysis_id=analysis_id,
-                    inventory_files=len(scanner.inventory),
-                    duplicate_groups=len(duplicates),
-                    pending_files=len(hasher.pending_files),
-                    pending_locations=len(scanner.pending_errors),
-                )
-
-            except AuditError as audit_error:
-                audit_errors.append(str(audit_error))
-
-            try:
-                report_id = self.report_store.save_report(
-                    report,
-                    config,
-                    started_at=started_at,
-                    finished_at=finished_at,
-                    report_id=attempt_id,
-                )
-
-                persistence = {
-                    'saved': True,
-                    'report_id': report_id,
-                    'error': None,
-                }
-
-            except OperationAuditError as error:
-                audit_errors.append(str(error))
-
-                persistence = {
-                    'saved': error.completed,
-                    'report_id': (
-                        error.result
-                        if error.completed else None
-                    ),
-                    'error': (
-                        None
-                        if error.completed else str(error)
-                    ),
-                }
-
-            except Exception as error:
-                if isinstance(error, AuditError):
-                    audit_errors.append(str(error))
-
-                persistence = {
-                    'saved': False,
-                    'report_id': None,
-                    'error': f'{type(error).__name__}: {error}',
-                }
-
-            report['persistence'] = {
-                **persistence,
-                'started_at': started_at,
-                'finished_at': finished_at,
-                'attempt_id': attempt_id,
-                'config': config,
-                'save_attempts': 1,
-                'audit_error': ' | '.join(audit_errors) or None,
-            }
 
             self.result_ready.emit(report)
 
         except Exception as error:
-            message = f'{type(error).__name__}: {error}'
+            notes = " | ".join(
+                getattr(error, "__notes__", ())
+            )
 
-            try:
-                audit_event(
-                    'SCAN_FAILED',
-                    analysis_id=analysis_id,
-                    error_type=type(error).__name__,
-                    error=str(error),
-                )
-
-            except AuditError as audit_error:
-                message += f' | Auditoria: {audit_error}'
-
-            self.error.emit(message)
+            self.error.emit(
+                f"{type(error).__name__}: {error}"
+                + (f" | {notes}" if notes else "")
+            )
 
 
 class ReportSaveWorker(QThread):
@@ -675,7 +500,7 @@ class HistoryWorker(QThread):
             self.error.emit(f'{type(error).__name__}: {error}')
 
 
-class DedupApp(QMainWindow):
+class DedupApp(ManualControls, QMainWindow):
     def __init__(self, config=None, *, report_store=None):
         super().__init__()
         self.setWindowTitle('Dedup v1 - Análise de arquivos duplicados')
@@ -704,6 +529,7 @@ class DedupApp(QMainWindow):
             self.config = None
             self._config_error = str(error)
         self.setup_ui()
+        self.setup_manual_controls()
         if self.config is not None:
             self.list_folders.addItems(self.config['monitored_paths'])
         else:
@@ -743,7 +569,10 @@ class DedupApp(QMainWindow):
         folders = QHBoxLayout()
         self.list_folders = QListWidget()
         self.list_folders.setFixedHeight(80)
-        self.list_folders.setToolTip('Pastas desta sessão. Alterações aqui não gravam o JSON.')
+        self.list_folders.setToolTip(
+            "Cada pasta inclui todas as subpastas. "
+            "Os arquivos serão comparados entre elas."
+        )
         folders.addWidget(self.list_folders)
         folder_buttons = QVBoxLayout()
         self.btn_add_folder = QPushButton('Adicionar pasta')
@@ -964,6 +793,13 @@ class DedupApp(QMainWindow):
         if not self._has_unsaved_report():
             return True
 
+        if checkpoint_matches(self.last_report):
+            self.persistence_label.setText(
+                "Relatório completo preservado "
+                "para recuperação pela interface."
+            )
+            return True
+
         self.persistence_label.setText(
             'Relatório ainda não salvo. Use "Tentar salvar novamente" '
             'e confirme a gravação antes de iniciar outra análise, '
@@ -1010,7 +846,7 @@ class DedupApp(QMainWindow):
     def adicionar_diretorio(self):
         if self._busy() or self.config is None:
             return
-        path = QFileDialog.getExistingDirectory(self, 'Selecione a pasta do setor')
+        path = QFileDialog.getExistingDirectory(self, 'Escolha a pasta para comparar')
         if path:
             paths = [self.list_folders.item(i).text() for i in range(self.list_folders.count())]
             try:
@@ -1030,8 +866,7 @@ class DedupApp(QMainWindow):
         self._update_controls()
 
     def iniciar_varredura(self):
-        if self._busy() or self.config is None:
-            return
+        self.start_manual_analysis()
 
         if not self._allow_report_change():
             return
@@ -1220,7 +1055,10 @@ class DedupApp(QMainWindow):
                 self._history_error(f'{type(error).__name__}: {error}')
                 return
             self.tabs.setCurrentIndex(0)
-            self.history_status.setText(f"Relatório histórico aberto: {snapshot['report_id']}.")
+            self.history_status.setText(
+                f"Relatório histórico aberto: {snapshot['report_id']}. "
+                + result.get("recovery_notice", "")
+            )
         else:
             items = []
             try:
@@ -1330,6 +1168,19 @@ class DedupApp(QMainWindow):
                 self.persistence_label.text()
                 + ' AUDITORIA PENDENTE: '
                 + persistence['audit_error']
+            )
+
+        if persistence.get("recovery_path"):
+            self.persistence_label.setText(
+                self.persistence_label.text()
+                + " Recuperação disponível pela interface."
+            )
+
+        if persistence.get("state_error"):
+            self.persistence_label.setText(
+                self.persistence_label.text()
+                + " Estado pendente: "
+                + persistence["state_error"]
             )
 
     def apresentar_relatorio(self, report, *, snapshot=None):
