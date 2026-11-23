@@ -8,6 +8,10 @@ from utils.logger import AuditError, audit_event
 from utils.audit import OperationAuditError
 from core.analysis import run_analysis
 from gui.manual import ManualControls, checkpoint_matches
+from gui.backup_catalog import (
+    setup_backup_catalog,
+    update_backup_controls,
+)
 
 from PyQt6.QtCore import Qt, QThread, QSignalBlocker, QDateTime, QTimeZone, pyqtSignal
 from PyQt6.QtWidgets import (
@@ -530,11 +534,13 @@ class DedupApp(ManualControls, QMainWindow):
             self._config_error = str(error)
         self.setup_ui()
         self.setup_manual_controls()
+        setup_backup_catalog(self)
         if self.config is not None:
             self.list_folders.addItems(self.config['monitored_paths'])
         else:
             self.status_label.setText(f'Configuração inválida: {self._config_error}')
         self._update_controls()
+
 
     @staticmethod
     def _table(headers):
@@ -842,6 +848,7 @@ class DedupApp(ManualControls, QMainWindow):
         self.btn_delete.setEnabled(False)
         self.btn_merge.setToolTip(ACTION_NOTICE)
         self.btn_delete.setToolTip(ACTION_NOTICE)
+        update_backup_controls(self)
 
     def adicionar_diretorio(self):
         if self._busy() or self.config is None:
